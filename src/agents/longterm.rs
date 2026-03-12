@@ -113,3 +113,131 @@ impl Agent for LongTermAgent {
         Ok(())
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::agents::traits::Agent;
+
+    #[test]
+    fn defaults_no_signal() {
+        let agent = LongTermAgent::new();
+        // Defaults: mvrv=3.0, nupl=0.5, fg=50 — should NOT trigger
+        assert!(!agent.should_long());
+        assert!(!agent.should_exit());
+    }
+
+    #[test]
+    fn accumulation_zone_triggers_long() {
+        let mut agent = LongTermAgent::new();
+        agent.mvrv_zscore = Some(0.5); // < 1
+        agent.nupl = Some(-0.1);       // < 0
+        agent.fear_greed = Some(10.0);  // < 20
+        assert!(agent.should_long());
+    }
+
+    #[test]
+    fn partial_signal_no_long() {
+        let mut agent = LongTermAgent::new();
+        agent.mvrv_zscore = Some(0.5); // < 1
+        agent.nupl = Some(0.3);        // > 0 — breaks condition
+        agent.fear_greed = Some(10.0);
+        assert!(!agent.should_long());
+    }
+
+    #[test]
+    fn exit_on_mvrv_high() {
+        let mut agent = LongTermAgent::new();
+        agent.mvrv_zscore = Some(8.0); // > 7
+        agent.nupl = Some(0.5);
+        assert!(agent.should_exit());
+    }
+
+    #[test]
+    fn exit_on_nupl_high() {
+        let mut agent = LongTermAgent::new();
+        agent.mvrv_zscore = Some(3.0);
+        agent.nupl = Some(0.8); // > 0.75
+        assert!(agent.should_exit());
+    }
+
+    #[test]
+    fn no_exit_in_normal_range() {
+        let mut agent = LongTermAgent::new();
+        agent.mvrv_zscore = Some(3.0);
+        agent.nupl = Some(0.5);
+        assert!(!agent.should_exit());
+    }
+
+    #[tokio::test]
+    async fn on_event_updates_onchain() {
+        let mut agent = LongTermAgent::new();
+        agent
+            .on_event(Event::OnChain(OnChainEvent {
+                metric: "MVRV_zscore".into(),
+                value: 0.8,
+                timestamp: Utc::now(),
+            }))
+            .await
+            .unwrap();
+        assert_eq!(agent.mvrv_zscore, Some(0.8));
+
+        agent
+            .on_event(Event::OnChain(OnChainEvent {
+                metric: "NUPL".into(),
+                value: -0.2,
+                timestamp: Utc::now(),
+            }))
+            .await
+            .unwrap();
+        assert_eq!(agent.nupl, Some(-0.2));
+    }
+
+    #[tokio::test]
+    async fn on_event_updates_price() {
+        let mut agent = LongTermAgent::new();
+        agent
+            .on_event(Event::Price(PriceEvent {
+                symbol: Symbol::BTC,
+                price: 42000.0,
+                volume_24h: 1e9,
+                timestamp: Utc::now(),
+            }))
+            .await
+            .unwrap();
+        assert_eq!(agent.price_btc, Some(42000.0));
+    }
+
+    #[tokio::test]
+    async fn propose_returns_none_without_signal() {
+        let agent = LongTermAgent::new();
+        let proposal = agent.propose().await.unwrap();
+        assert!(proposal.is_none());
+    }
+
+    #[tokio::test]
+    async fn propose_returns_some_with_signal() {
+        let mut agent = LongTermAgent::new();
+        agent.mvrv_zscore = Some(0.5);
+        agent.nupl = Some(-0.1);
+        agent.fear_greed = Some(10.0);
+        agent.price_btc = Some(30000.0);
+        let proposal = agent.propose().await.unwrap();
+        assert!(proposal.is_some());
+        let p = proposal.unwrap();
+        assert_eq!(p.proposer, AgentName::LongTerm);
+        assert_eq!(p.direction, Direction::Long);
+        assert_eq!(p.leverage, 1.0);
+    }
+
+    #[tokio::test]
+    async fn propose_none_when_signal_but_no_price() {
+        let mut agent = LongTermAgent::new();
+        agent.mvrv_zscore = Some(0.5);
+        agent.nupl = Some(-0.1);
+        agent.fear_greed = Some(10.0);
+        // price_btc is None → defaults to 0.0 → returns None
+        let proposal = agent.propose().await.unwrap();
+        assert!(proposal.is_none());
+    }
+}

@@ -114,3 +114,164 @@ impl RiskManager {
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use uuid::Uuid;
+
+    fn make_limits() -> HashMap<AgentName, RiskLimits> {
+        let mut m = HashMap::new();
+        m.insert(
+            AgentName::MidTerm,
+            RiskLimits {
+                max_leverage: 5.0,
+                max_per_trade_pct: 5.0,
+                max_total_exposure_pct: 20.0,
+            },
+        );
+        m.insert(
+            AgentName::ShortTerm,
+            RiskLimits {
+                max_leverage: 20.0,
+                max_per_trade_pct: 2.0,
+                max_total_exposure_pct: 10.0,
+            },
+        );
+        m.insert(
+            AgentName::LongTerm,
+            RiskLimits {
+                max_leverage: 2.0,
+                max_per_trade_pct: 6.0,
+                max_total_exposure_pct: 100.0,
+            },
+        );
+        m
+    }
+
+    fn make_proposal(agent: AgentName, size: f64, leverage: f64) -> TradeProposal {
+        TradeProposal {
+            id: Uuid::new_v4(),
+            proposer: agent,
+            symbol: Symbol::BTC,
+            direction: Direction::Long,
+            size_usd: size,
+            leverage,
+            entry_price: 50000.0,
+            stop_loss: 47500.0,
+            take_profit: 55000.0,
+            rationale: "test".into(),
+            signals: vec![],
+            timestamp: Utc::now(),
+        }
+    }
+
+    fn empty_portfolio(equity: f64) -> Portfolio {
+        Portfolio {
+            total_equity_usd: equity,
+            free_cash_usd: equity,
+            positions: vec![],
+            realized_pnl: 0.0,
+            peak_equity: equity,
+        }
+    }
+
+    #[test]
+    fn accept_valid_proposal() {
+        let rm = RiskManager::new(make_limits());
+        let proposal = make_proposal(AgentName::MidTerm, 400.0, 3.0);
+        let portfolio = empty_portfolio(10000.0);
+        let decision = rm.evaluate(&proposal, &portfolio);
+        assert_eq!(decision.verdict, Verdict::Accept);
+    }
+
+    #[test]
+    fn reject_excess_leverage() {
+        let rm = RiskManager::new(make_limits());
+        let proposal = make_proposal(AgentName::MidTerm, 400.0, 6.0); // max is 5x
+        let portfolio = empty_portfolio(10000.0);
+        let decision = rm.evaluate(&proposal, &portfolio);
+        assert_eq!(decision.verdict, Verdict::Reject);
+        assert!(decision.reason.contains("Leverage"));
+    }
+
+    #[test]
+    fn adjust_oversized_trade() {
+        let rm = RiskManager::new(make_limits());
+        // MidTerm max_per_trade = 5% of 10000 = 500
+        let proposal = make_proposal(AgentName::MidTerm, 800.0, 3.0);
+        let portfolio = empty_portfolio(10000.0);
+        let decision = rm.evaluate(&proposal, &portfolio);
+        assert_eq!(decision.verdict, Verdict::Adjust);
+        assert_eq!(decision.adjusted_size, Some(500.0));
+    }
+
+    #[test]
+    fn adjust_when_exposure_exceeded() {
+        let rm = RiskManager::new(make_limits());
+        // MidTerm max_total_exposure = 20% of 10000 = 2000
+        // Already have 1800 exposure
+        let mut portfolio = empty_portfolio(10000.0);
+        portfolio.positions.push(Position {
+            id: Uuid::new_v4(),
+            proposer: AgentName::MidTerm,
+            symbol: Symbol::BTC,
+            direction: Direction::Long,
+            size_usd: 1800.0,
+            leverage: 3.0,
+            entry_price: 50000.0,
+            stop_loss: 47500.0,
+            take_profit: 55000.0,
+            opened_at: Utc::now(),
+            unrealized_pnl: 0.0,
+        });
+        let proposal = make_proposal(AgentName::MidTerm, 400.0, 3.0);
+        let decision = rm.evaluate(&proposal, &portfolio);
+        assert_eq!(decision.verdict, Verdict::Adjust);
+        // remaining = 2000 - 1800 = 200
+        assert_eq!(decision.adjusted_size, Some(200.0));
+    }
+
+    #[test]
+    fn reject_at_max_exposure() {
+        let rm = RiskManager::new(make_limits());
+        let mut portfolio = empty_portfolio(10000.0);
+        portfolio.positions.push(Position {
+            id: Uuid::new_v4(),
+            proposer: AgentName::MidTerm,
+            symbol: Symbol::BTC,
+            direction: Direction::Long,
+            size_usd: 2000.0, // exactly at 20% cap
+            leverage: 3.0,
+            entry_price: 50000.0,
+            stop_loss: 47500.0,
+            take_profit: 55000.0,
+            opened_at: Utc::now(),
+            unrealized_pnl: 0.0,
+        });
+        let proposal = make_proposal(AgentName::MidTerm, 100.0, 3.0);
+        let decision = rm.evaluate(&proposal, &portfolio);
+        assert_eq!(decision.verdict, Verdict::Reject);
+        assert!(decision.reason.contains("max total exposure"));
+    }
+
+    #[test]
+    fn reject_unknown_agent() {
+        let rm = RiskManager::new(HashMap::new()); // no limits defined
+        let proposal = make_proposal(AgentName::MidTerm, 100.0, 1.0);
+        let portfolio = empty_portfolio(10000.0);
+        let decision = rm.evaluate(&proposal, &portfolio);
+        assert_eq!(decision.verdict, Verdict::Reject);
+        assert!(decision.reason.contains("Unknown agent"));
+    }
+
+    #[test]
+    fn accept_at_exact_limit() {
+        let rm = RiskManager::new(make_limits());
+        // MidTerm: exactly 5% of 10000 = 500, exactly 5x leverage
+        let proposal = make_proposal(AgentName::MidTerm, 500.0, 5.0);
+        let portfolio = empty_portfolio(10000.0);
+        let decision = rm.evaluate(&proposal, &portfolio);
+        assert_eq!(decision.verdict, Verdict::Accept);
+    }
+}

@@ -254,3 +254,75 @@ pub struct RiskLimits {
     pub max_per_trade_pct: f64,
     pub max_total_exposure_pct: f64,
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn make_position(agent: AgentName, size: f64) -> Position {
+        Position {
+            id: Uuid::new_v4(),
+            proposer: agent,
+            symbol: Symbol::BTC,
+            direction: Direction::Long,
+            size_usd: size,
+            leverage: 1.0,
+            entry_price: 50000.0,
+            stop_loss: 47500.0,
+            take_profit: 55000.0,
+            opened_at: Utc::now(),
+            unrealized_pnl: 0.0,
+        }
+    }
+
+    #[test]
+    fn drawdown_pct_no_drawdown() {
+        let p = Portfolio {
+            total_equity_usd: 10000.0,
+            peak_equity: 10000.0,
+            ..Default::default()
+        };
+        assert!((p.drawdown_pct() - 0.0).abs() < f64::EPSILON);
+    }
+
+    #[test]
+    fn drawdown_pct_with_loss() {
+        let p = Portfolio {
+            total_equity_usd: 8500.0,
+            peak_equity: 10000.0,
+            ..Default::default()
+        };
+        assert!((p.drawdown_pct() - 15.0).abs() < f64::EPSILON);
+    }
+
+    #[test]
+    fn drawdown_pct_zero_peak() {
+        let p = Portfolio {
+            total_equity_usd: 0.0,
+            peak_equity: 0.0,
+            ..Default::default()
+        };
+        assert!((p.drawdown_pct() - 0.0).abs() < f64::EPSILON);
+    }
+
+    #[test]
+    fn agent_exposure_empty() {
+        let p = Portfolio::default();
+        assert!((p.agent_exposure(AgentName::MidTerm) - 0.0).abs() < f64::EPSILON);
+    }
+
+    #[test]
+    fn agent_exposure_filters_by_agent() {
+        let p = Portfolio {
+            positions: vec![
+                make_position(AgentName::MidTerm, 500.0),
+                make_position(AgentName::MidTerm, 300.0),
+                make_position(AgentName::ShortTerm, 200.0),
+            ],
+            ..Default::default()
+        };
+        assert!((p.agent_exposure(AgentName::MidTerm) - 800.0).abs() < f64::EPSILON);
+        assert!((p.agent_exposure(AgentName::ShortTerm) - 200.0).abs() < f64::EPSILON);
+        assert!((p.agent_exposure(AgentName::LongTerm) - 0.0).abs() < f64::EPSILON);
+    }
+}

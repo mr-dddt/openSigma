@@ -180,3 +180,127 @@ impl Agent for ShortTermAgent {
         Ok(())
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::agents::traits::Agent;
+
+    #[test]
+    fn defaults_no_signal() {
+        let agent = ShortTermAgent::new();
+        assert!(!agent.long_scalp_signal());
+        assert!(!agent.short_scalp_signal());
+        assert!(!agent.paused_for_news);
+        assert_eq!(agent.status(), AgentStatus::Watching);
+    }
+
+    #[test]
+    fn pause_and_resume() {
+        let mut agent = ShortTermAgent::new();
+        agent.pause_for_news();
+        assert!(agent.paused_for_news);
+        assert_eq!(agent.status(), AgentStatus::Paused);
+        agent.resume();
+        assert!(!agent.paused_for_news);
+        assert_eq!(agent.status(), AgentStatus::Watching);
+    }
+
+    #[tokio::test]
+    async fn on_event_ignores_when_paused() {
+        let mut agent = ShortTermAgent::new();
+        agent.pause_for_news();
+        // Price event should be ignored
+        agent
+            .on_event(Event::Price(PriceEvent {
+                symbol: Symbol::BTC,
+                price: 50000.0,
+                volume_24h: 1e9,
+                timestamp: Utc::now(),
+            }))
+            .await
+            .unwrap();
+        assert!(agent.price_btc.is_none());
+    }
+
+    #[tokio::test]
+    async fn on_event_updates_funding() {
+        let mut agent = ShortTermAgent::new();
+        agent
+            .on_event(Event::Funding(FundingEvent {
+                symbol: Symbol::BTC,
+                rate: 0.02,
+                timestamp: Utc::now(),
+            }))
+            .await
+            .unwrap();
+        assert_eq!(agent.funding_realtime, Some(0.02));
+    }
+
+    #[tokio::test]
+    async fn on_event_sets_liq_grab() {
+        let mut agent = ShortTermAgent::new();
+        assert!(!agent.liq_grab_detected);
+        agent
+            .on_event(Event::Liquidation(LiquidationEvent {
+                symbol: Symbol::BTC,
+                direction: Direction::Long,
+                size_usd: 100000.0,
+                price: 49000.0,
+                timestamp: Utc::now(),
+            }))
+            .await
+            .unwrap();
+        assert!(agent.liq_grab_detected);
+    }
+
+    #[tokio::test]
+    async fn high_urgency_news_pauses_agent() {
+        let mut agent = ShortTermAgent::new();
+        agent
+            .on_event(Event::News(TextEvent {
+                source: "test".into(),
+                headline: "Flash crash".into(),
+                sentiment: -0.9,
+                urgency: 0.8, // > 0.7 threshold
+                dedup_hash: 1,
+                timestamp: Utc::now(),
+            }))
+            .await
+            .unwrap();
+        assert!(agent.paused_for_news);
+        assert_eq!(agent.status(), AgentStatus::Paused);
+    }
+
+    #[tokio::test]
+    async fn low_urgency_news_does_not_pause() {
+        let mut agent = ShortTermAgent::new();
+        agent
+            .on_event(Event::News(TextEvent {
+                source: "test".into(),
+                headline: "Minor update".into(),
+                sentiment: 0.1,
+                urgency: 0.3, // < 0.7
+                dedup_hash: 2,
+                timestamp: Utc::now(),
+            }))
+            .await
+            .unwrap();
+        assert!(!agent.paused_for_news);
+    }
+
+    #[tokio::test]
+    async fn propose_none_when_paused() {
+        let mut agent = ShortTermAgent::new();
+        agent.pause_for_news();
+        let proposal = agent.propose().await.unwrap();
+        assert!(proposal.is_none());
+    }
+
+    #[test]
+    fn kill_zone_detection() {
+        // This test is time-dependent, so we just verify the method runs
+        let agent = ShortTermAgent::new();
+        let _result = agent.in_kill_zone(); // doesn't panic
+    }
+}

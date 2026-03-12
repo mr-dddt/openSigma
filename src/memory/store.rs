@@ -141,3 +141,118 @@ impl MemoryStore {
         &self.db
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use chrono::Utc;
+    use uuid::Uuid;
+
+    fn make_decision() -> TradeDecision {
+        TradeDecision {
+            proposal: TradeProposal {
+                id: Uuid::new_v4(),
+                proposer: AgentName::MidTerm,
+                symbol: Symbol::BTC,
+                direction: Direction::Long,
+                size_usd: 500.0,
+                leverage: 3.0,
+                entry_price: 50000.0,
+                stop_loss: 47500.0,
+                take_profit: 55000.0,
+                rationale: "test trade".into(),
+                signals: vec!["RSI=55".into()],
+                timestamp: Utc::now(),
+            },
+            verdict: Verdict::Accept,
+            reason: "All checks passed".into(),
+            adjusted_size: None,
+            adjusted_leverage: None,
+            timestamp: Utc::now(),
+        }
+    }
+
+    fn setup_temp_store() -> (MemoryStore, tempfile::TempDir) {
+        let dir = tempfile::tempdir().unwrap();
+        // Create the memory.md file so append works
+        std::fs::write(dir.path().join("memory.md"), "# Trade Memory\n").unwrap();
+        let store = MemoryStore::new(dir.path().to_str().unwrap()).unwrap();
+        (store, dir)
+    }
+
+    #[test]
+    fn record_open_and_query() {
+        let (store, _dir) = setup_temp_store();
+        let decision = make_decision();
+        let trade_id = decision.proposal.id.to_string();
+        store.record_open(&decision).unwrap();
+
+        let open = store.open_trades().unwrap();
+        assert_eq!(open.len(), 1);
+        assert_eq!(open[0], trade_id);
+    }
+
+    #[test]
+    fn record_close_removes_from_open() {
+        let (store, _dir) = setup_temp_store();
+        let decision = make_decision();
+        let trade_id = decision.proposal.id.to_string();
+        store.record_open(&decision).unwrap();
+        store
+            .record_close(&trade_id, 52000.0, 4.0, "Good entry timing")
+            .unwrap();
+
+        let open = store.open_trades().unwrap();
+        assert!(open.is_empty());
+    }
+
+    #[test]
+    fn memory_md_updated_on_close() {
+        let (store, _dir) = setup_temp_store();
+        let decision = make_decision();
+        let trade_id = decision.proposal.id.to_string();
+        store.record_open(&decision).unwrap();
+        store
+            .record_close(&trade_id, 52000.0, 4.0, "Good entry timing")
+            .unwrap();
+
+        let memory = store.read_memory().unwrap();
+        assert!(memory.contains("CLOSED +4.00%"));
+        assert!(memory.contains("Good entry timing"));
+    }
+
+    #[test]
+    fn multiple_trades_tracking() {
+        let (store, _dir) = setup_temp_store();
+        let d1 = make_decision();
+        let d2 = make_decision();
+        let id1 = d1.proposal.id.to_string();
+        let id2 = d2.proposal.id.to_string();
+        store.record_open(&d1).unwrap();
+        store.record_open(&d2).unwrap();
+
+        let open = store.open_trades().unwrap();
+        assert_eq!(open.len(), 2);
+
+        store
+            .record_close(&id1, 48000.0, -4.0, "Bad timing")
+            .unwrap();
+        let open = store.open_trades().unwrap();
+        assert_eq!(open.len(), 1);
+        assert_eq!(open[0], id2);
+    }
+
+    #[test]
+    fn negative_pnl_format() {
+        let (store, _dir) = setup_temp_store();
+        let decision = make_decision();
+        let trade_id = decision.proposal.id.to_string();
+        store.record_open(&decision).unwrap();
+        store
+            .record_close(&trade_id, 48000.0, -3.5, "Stop hit")
+            .unwrap();
+
+        let memory = store.read_memory().unwrap();
+        assert!(memory.contains("CLOSED -3.50%"));
+    }
+}

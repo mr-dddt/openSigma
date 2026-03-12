@@ -62,9 +62,10 @@ async fn main() -> Result<()> {
 
     // Initialize components
     let risk_manager = RiskManager::new(config.risk_limits.clone());
-    let _executor = HyperliquidExecutor::new(config.private_key.clone());
+    let executor = HyperliquidExecutor::new(&config.private_key, config.is_mainnet).await?;
 
-    let initial_balance = _executor.get_balance().await.unwrap_or(10000.0);
+    let initial_balance = executor.get_balance().await.unwrap_or(10000.0);
+    let _executor = executor; // Keep executor alive for future use
     let mut watchdog = WatchDogAgent::new(risk_manager, proposal_rx, initial_balance);
 
     // Topic router
@@ -80,7 +81,7 @@ async fn main() -> Result<()> {
     let rule_engine = RuleEngine::new(event_tx.clone());
     let mut llm_filter = LlmFilter::new(event_tx.clone(), config.anthropic_api_key.clone());
     let hl_feed = hl_data::HyperliquidFeed::new(event_tx.clone());
-    let cg_feed = coinglass::CoinglasFeed::new(event_tx.clone(), config.coinglass_api_key.clone());
+    let cg_feed = coinglass::CoinglassFeed::new(event_tx.clone(), config.coinglass_api_key.clone());
     let gn_feed = glassnode::GlassnodeFeed::new(event_tx.clone(), config.glassnode_api_key.clone());
     let macro_feed = macro_sources::MacroFeed::new(event_tx.clone());
 

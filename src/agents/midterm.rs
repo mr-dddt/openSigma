@@ -136,3 +136,128 @@ impl Agent for MidTermAgent {
         Ok(())
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::agents::traits::Agent;
+
+    #[test]
+    fn defaults_no_signal() {
+        let agent = MidTermAgent::new();
+        assert!(!agent.long_signal());
+        assert!(!agent.short_signal());
+    }
+
+    #[test]
+    fn long_signal_triggers() {
+        let mut agent = MidTermAgent::new();
+        agent.ema_ribbon_bullish = true;
+        agent.weekly_rsi = Some(55.0); // < 65
+        agent.funding_7d_avg = Some(0.01); // < 0.05
+        assert!(agent.long_signal());
+    }
+
+    #[test]
+    fn long_signal_blocked_by_high_rsi() {
+        let mut agent = MidTermAgent::new();
+        agent.ema_ribbon_bullish = true;
+        agent.weekly_rsi = Some(70.0); // >= 65
+        agent.funding_7d_avg = Some(0.01);
+        assert!(!agent.long_signal());
+    }
+
+    #[test]
+    fn long_signal_blocked_by_high_funding() {
+        let mut agent = MidTermAgent::new();
+        agent.ema_ribbon_bullish = true;
+        agent.weekly_rsi = Some(55.0);
+        agent.funding_7d_avg = Some(0.06); // >= 0.05
+        assert!(!agent.long_signal());
+    }
+
+    #[test]
+    fn short_signal_triggers() {
+        let mut agent = MidTermAgent::new();
+        agent.weekly_macd_positive = false; // !macd_positive
+        agent.oi_trend_rising = true;
+        agent.weekly_rsi = Some(75.0); // > 70
+        assert!(agent.short_signal());
+    }
+
+    #[test]
+    fn short_signal_blocked_by_positive_macd() {
+        let mut agent = MidTermAgent::new();
+        agent.weekly_macd_positive = true;
+        agent.oi_trend_rising = true;
+        agent.weekly_rsi = Some(75.0);
+        assert!(!agent.short_signal());
+    }
+
+    #[tokio::test]
+    async fn on_event_updates_funding() {
+        let mut agent = MidTermAgent::new();
+        agent
+            .on_event(Event::Funding(FundingEvent {
+                symbol: Symbol::BTC,
+                rate: 0.03,
+                timestamp: Utc::now(),
+            }))
+            .await
+            .unwrap();
+        assert_eq!(agent.funding_7d_avg, Some(0.03));
+    }
+
+    #[tokio::test]
+    async fn on_event_updates_oi() {
+        let mut agent = MidTermAgent::new();
+        agent
+            .on_event(Event::OpenInterest(OpenInterestEvent {
+                symbol: Symbol::BTC,
+                oi_usd: 5e9,
+                change_pct: 3.0,
+                timestamp: Utc::now(),
+            }))
+            .await
+            .unwrap();
+        assert!(agent.oi_trend_rising);
+
+        agent
+            .on_event(Event::OpenInterest(OpenInterestEvent {
+                symbol: Symbol::BTC,
+                oi_usd: 5e9,
+                change_pct: -1.0,
+                timestamp: Utc::now(),
+            }))
+            .await
+            .unwrap();
+        assert!(!agent.oi_trend_rising);
+    }
+
+    #[tokio::test]
+    async fn propose_long_with_signal() {
+        let mut agent = MidTermAgent::new();
+        agent.ema_ribbon_bullish = true;
+        agent.weekly_rsi = Some(55.0);
+        agent.funding_7d_avg = Some(0.01);
+        agent.price_btc = Some(50000.0);
+        let proposal = agent.propose().await.unwrap();
+        assert!(proposal.is_some());
+        let p = proposal.unwrap();
+        assert_eq!(p.direction, Direction::Long);
+        assert_eq!(p.leverage, 3.0);
+    }
+
+    #[tokio::test]
+    async fn propose_short_with_signal() {
+        let mut agent = MidTermAgent::new();
+        agent.weekly_macd_positive = false;
+        agent.oi_trend_rising = true;
+        agent.weekly_rsi = Some(75.0);
+        agent.price_btc = Some(50000.0);
+        let proposal = agent.propose().await.unwrap();
+        assert!(proposal.is_some());
+        let p = proposal.unwrap();
+        assert_eq!(p.direction, Direction::Short);
+    }
+}

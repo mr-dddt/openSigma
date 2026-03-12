@@ -43,3 +43,32 @@ impl LlmFilter {
         !self.seen_hashes.insert(hash)
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn dedup_first_seen_not_duplicate() {
+        let (tx, _rx) = mpsc::channel(1);
+        let mut filter = LlmFilter::new(tx, String::new());
+        assert!(!filter.is_duplicate(12345));
+    }
+
+    #[test]
+    fn dedup_second_seen_is_duplicate() {
+        let (tx, _rx) = mpsc::channel(1);
+        let mut filter = LlmFilter::new(tx, String::new());
+        assert!(!filter.is_duplicate(12345));
+        assert!(filter.is_duplicate(12345));
+    }
+
+    #[test]
+    fn dedup_different_hashes_not_duplicate() {
+        let (tx, _rx) = mpsc::channel(1);
+        let mut filter = LlmFilter::new(tx, String::new());
+        assert!(!filter.is_duplicate(111));
+        assert!(!filter.is_duplicate(222));
+        assert!(!filter.is_duplicate(333));
+    }
+}

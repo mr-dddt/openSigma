@@ -46,3 +46,12 @@ thiserror = "2"
 # Unique IDs
 uuid = { version = "1", features = ["v4", "serde"] }
 async-trait = "0.1"
+
+# MessagePack (Hyperliquid phantom agent signing)
+rmp-serde = "1"
+
+# Hex encoding
+hex = "0.4"
+
+[dev-dependencies]
+tempfile = "3"
