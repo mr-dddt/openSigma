@@ -1,10 +1,9 @@
-mod agents;
+mod agent;
 mod config;
 mod data;
-mod event_bus;
 mod execution;
-mod memory;
-mod risk;
+mod journal;
+mod signals;
 mod tui;
 mod types;
 
@@ -12,13 +11,12 @@ use anyhow::Result;
 use tokio::sync::mpsc;
 use tracing::info;
 
-use crate::agents::watchdog::WatchDogAgent;
-use crate::config::Config;
-use crate::data::{coinglass, glassnode, hyperliquid as hl_data, macro_sources};
-use crate::event_bus::{llm_filter::LlmFilter, router::TopicRouter, rule_engine::RuleEngine};
-use crate::execution::hyperliquid::HyperliquidExecutor;
-use crate::memory::store::MemoryStore;
-use crate::risk::manager::RiskManager;
+use crate::config::{Config, Secrets};
+use crate::data::hyperliquid::HyperliquidFeed;
+use crate::data::news::NewsFeed;
+use crate::data::polymarket::PolymarketFeed;
+use crate::signals::aggregator::SignalAggregator;
+use crate::signals::indicators::Indicators;
 use crate::tui::app::App;
 use crate::types::*;
 
@@ -32,90 +30,148 @@ async fn main() -> Result<()> {
         )
         .init();
 
-    info!("openSigma starting...");
+    info!("openSigma v2 starting...");
 
     // Load config
-    let config = Config::from_env()?;
+    let config = Config::load("config.toml")?;
+    let _secrets = Secrets::from_env()?;
 
-    // Initialize memory store
-    let _memory_store = MemoryStore::new("memory")?;
-
-    // Channel buffer sizes
-    const BUS_BUFFER: usize = 1024;
-    const AGENT_BUFFER: usize = 256;
-    const PROPOSAL_BUFFER: usize = 64;
-
-    // Event bus channels
-    let (event_tx, event_rx) = mpsc::channel::<Event>(BUS_BUFFER);
-
-    // Per-agent event channels
-    let (watchdog_event_tx, watchdog_event_rx) = mpsc::channel::<Event>(AGENT_BUFFER);
-    let (longterm_event_tx, _longterm_event_rx) = mpsc::channel::<Event>(AGENT_BUFFER);
-    let (midterm_event_tx, _midterm_event_rx) = mpsc::channel::<Event>(AGENT_BUFFER);
-    let (shortterm_event_tx, _shortterm_event_rx) = mpsc::channel::<Event>(AGENT_BUFFER);
-
-    // Proposal channel (agents → WatchDog)
-    let (_proposal_tx, proposal_rx) = mpsc::channel::<TradeProposal>(PROPOSAL_BUFFER);
-
-    // Kill switch channel (TUI → WatchDog)
-    let (kill_switch_tx, mut kill_switch_rx) = mpsc::channel::<()>(1);
-
-    // Initialize components
-    let risk_manager = RiskManager::new(config.risk_limits.clone());
-    let executor = HyperliquidExecutor::new(&config.private_key, config.is_mainnet).await?;
-
-    let initial_balance = executor.get_balance().await.unwrap_or(10000.0);
-    let _executor = executor; // Keep executor alive for future use
-    let mut watchdog = WatchDogAgent::new(risk_manager, proposal_rx, initial_balance);
-
-    // Topic router
-    let mut router = TopicRouter::new(
-        event_rx,
-        watchdog_event_tx,
-        longterm_event_tx,
-        midterm_event_tx,
-        shortterm_event_tx,
+    info!(
+        capital = config.capital.initial_usd,
+        max_trade_pct = config.capital.max_trade_pct,
+        max_leverage = config.hyperliquid.max_leverage,
+        "Config loaded"
     );
 
-    // Data feeds
-    let rule_engine = RuleEngine::new(event_tx.clone());
-    let mut llm_filter = LlmFilter::new(event_tx.clone(), config.anthropic_api_key.clone());
-    let hl_feed = hl_data::HyperliquidFeed::new(event_tx.clone());
-    let cg_feed = coinglass::CoinglassFeed::new(event_tx.clone(), config.coinglass_api_key.clone());
-    let gn_feed = glassnode::GlassnodeFeed::new(event_tx.clone(), config.glassnode_api_key.clone());
-    let macro_feed = macro_sources::MacroFeed::new(event_tx.clone());
+    // Channel for market events (all data feeds → signal engine)
+    let (market_tx, mut market_rx) = mpsc::channel::<MarketEvent>(2048);
 
-    // TUI
-    let mut app = App::new(kill_switch_tx);
-
-    info!("All components initialized — spawning tasks");
-
-    // Spawn all async tasks
-    tokio::spawn(async move { rule_engine.run().await });
-    tokio::spawn(async move { llm_filter.run().await });
-    tokio::spawn(async move { router.run().await });
+    // Spawn Hyperliquid WebSocket feed
+    let hl_feed = HyperliquidFeed::new(market_tx.clone());
     tokio::spawn(async move { hl_feed.run().await });
-    tokio::spawn(async move { cg_feed.run().await });
-    tokio::spawn(async move { gn_feed.run().await });
-    tokio::spawn(async move { macro_feed.run().await });
 
-    // WatchDog task
-    tokio::spawn(async move {
-        let memory = MemoryStore::new("memory").expect("memory store");
-        watchdog.run(watchdog_event_rx, memory).await
-    });
+    // Spawn Polymarket feed (Phase 1 stub)
+    let pm_feed = PolymarketFeed::new(market_tx.clone());
+    tokio::spawn(async move { pm_feed.run().await });
 
-    // Kill switch listener
+    // Spawn news feed (Phase 1 stub)
+    let mut news_feed = NewsFeed::new();
+    tokio::spawn(async move { news_feed.run().await });
+
+    // Signal aggregator
+    let mut aggregator = SignalAggregator::new();
+    let config_clone = config.clone();
+
+    // Signal evaluation interval
+    let eval_interval =
+        tokio::time::Duration::from_secs(config.execution.signal_eval_interval_secs);
+    let mut eval_ticker = tokio::time::interval(eval_interval);
+
+    // TUI update channel
+    let (tui_tx, mut tui_rx) = mpsc::channel::<TuiUpdate>(256);
+    let tui_tx_clone = tui_tx.clone();
+
+    // Spawn the market event processor + signal engine
     tokio::spawn(async move {
-        if kill_switch_rx.recv().await.is_some() {
-            tracing::error!("KILL SWITCH activated from TUI");
-            // TODO: signal WatchDog to close all positions
+        loop {
+            tokio::select! {
+                Some(event) = market_rx.recv() => {
+                    match &event {
+                        MarketEvent::Price(tick) => {
+                            aggregator.update_price(tick.price);
+                            if tick.symbol == Symbol::BTC {
+                                let _ = tui_tx_clone.send(TuiUpdate::Price(tick.price)).await;
+                            }
+                        }
+                        MarketEvent::Trade(trade) => {
+                            let is_buy = trade.side == Direction::Long;
+                            aggregator.indicators.add_trade(trade.size, is_buy);
+                        }
+                        MarketEvent::OrderBook(book) => {
+                            let imbalance = Indicators::ob_imbalance(&book.bids, &book.asks, 10);
+                            aggregator.update_ob_imbalance(imbalance);
+                        }
+                        MarketEvent::Funding(tick) => {
+                            aggregator.update_funding(tick.rate);
+                        }
+                        MarketEvent::Liquidation(_) => {}
+                        MarketEvent::PmOdds(odds) => {
+                            aggregator.update_pm_odds(odds.up_price);
+                        }
+                    }
+                }
+                _ = eval_ticker.tick() => {
+                    let snapshot = aggregator.evaluate(&config_clone);
+                    let _ = tui_tx_clone.send(TuiUpdate::Signal(snapshot.clone())).await;
+
+                    // Phase 2: if filter passes, send to LLM gate
+                    if snapshot.level != SignalLevel::NoTrade && snapshot.level != SignalLevel::Weak {
+                        info!(
+                            level = %snapshot.level,
+                            score = snapshot.net_score,
+                            "Signal detected — would send to LLM (Phase 2)"
+                        );
+                        let _ = tui_tx_clone.send(TuiUpdate::Log(format!(
+                            "[{}] {} (net={}) — LLM gate pending Phase 2",
+                            chrono::Utc::now().format("%H:%M:%S"),
+                            snapshot.level,
+                            snapshot.net_score,
+                        ))).await;
+                    }
+                }
+                else => break,
+            }
         }
     });
 
-    // Run TUI on main thread (blocks until quit)
-    app.run().await?;
+    // TUI on main thread
+    let mut app = App::new(config.capital.initial_usd);
 
-    info!("openSigma shutting down");
+    crossterm::terminal::enable_raw_mode()?;
+    std::io::stdout().execute(crossterm::terminal::EnterAlternateScreen)?;
+    let mut terminal =
+        ratatui::Terminal::new(ratatui::prelude::CrosstermBackend::new(std::io::stdout()))?;
+
+    info!("All components initialized — entering main loop");
+
+    loop {
+        // Drain pending TUI updates
+        while let Ok(update) = tui_rx.try_recv() {
+            match update {
+                TuiUpdate::Price(p) => app.update_price(p),
+                TuiUpdate::Signal(s) => app.update_signal(s),
+                TuiUpdate::Log(l) => app.push_log(l),
+            }
+        }
+
+        terminal.draw(|frame| app.render_frame(frame))?;
+
+        if crossterm::event::poll(std::time::Duration::from_millis(50))? {
+            if let crossterm::event::Event::Key(key) = crossterm::event::read()? {
+                if key.kind == crossterm::event::KeyEventKind::Press {
+                    match key.code {
+                        crossterm::event::KeyCode::Char('q') => break,
+                        crossterm::event::KeyCode::Char('k') => {
+                            tracing::error!("KILL SWITCH activated");
+                            break;
+                        }
+                        _ => {}
+                    }
+                }
+            }
+        }
+    }
+
+    crossterm::terminal::disable_raw_mode()?;
+    std::io::stdout().execute(crossterm::terminal::LeaveAlternateScreen)?;
+    info!("openSigma v2 shutting down");
     Ok(())
+}
+
+use crossterm::ExecutableCommand;
+
+enum TuiUpdate {
+    Price(f64),
+    Signal(SignalSnapshot),
+    Log(String),
 }

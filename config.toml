@@ -1,0 +1,45 @@
+[capital]
+initial_usd = 5000.0
+max_trade_pct = 3.0
+max_concurrent_positions = 2
+max_daily_loss_pct = 5.0
+kill_switch_drawdown_pct = 10.0
+
+[hyperliquid]
+max_leverage = 10
+
+[polymarket]
+max_bet_usd = 50.0
+max_hedge_ratio = 0.10
+prefer_maker_orders = true
+min_window_remaining_secs = 60
+
+[execution]
+max_trade_duration_secs = 600
+max_second_looks = 3
+signal_eval_interval_secs = 5
+
+[sessions.ny_kill_zone]
+start = "13:30"
+end = "16:00"
+size_mult = 1.0
+
+[sessions.london_open]
+start = "07:00"
+end = "09:30"
+size_mult = 0.4
+
+[sessions.late_ny]
+start = "20:00"
+end = "22:00"
+size_mult = 0.6
+
+[llm]
+model = "claude-sonnet-4-20250514"
+timeout_ms = 3000
+
+[signals]
+strong_threshold = 5
+lean_threshold = 3
+min_atr_pct = 0.05
+max_funding_same_dir = 0.03

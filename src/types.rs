@@ -1,6 +1,5 @@
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
-use uuid::Uuid;
 
 // ---------------------------------------------------------------------------
 // Symbols & directions
@@ -27,63 +26,52 @@ pub enum Direction {
     Short,
 }
 
-// ---------------------------------------------------------------------------
-// Agent identity
-// ---------------------------------------------------------------------------
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
-pub enum AgentName {
-    WatchDog,
-    LongTerm,
-    MidTerm,
-    ShortTerm,
-}
-
-impl std::fmt::Display for AgentName {
+impl std::fmt::Display for Direction {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            AgentName::WatchDog => write!(f, "WatchDog"),
-            AgentName::LongTerm => write!(f, "LongTerm"),
-            AgentName::MidTerm => write!(f, "MidTerm"),
-            AgentName::ShortTerm => write!(f, "ShortTerm"),
+            Direction::Long => write!(f, "Long"),
+            Direction::Short => write!(f, "Short"),
         }
     }
 }
 
 // ---------------------------------------------------------------------------
-// Events — unified schema for the event bus
+// Market data types (from data feeds)
 // ---------------------------------------------------------------------------
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub enum Event {
-    Price(PriceEvent),
-    Funding(FundingEvent),
-    Liquidation(LiquidationEvent),
-    OpenInterest(OpenInterestEvent),
-    OnChain(OnChainEvent),
-    News(TextEvent),
-    DrawdownAlert(DrawdownEvent),
-    MacroCalendar(MacroEvent),
-    MemoryReload,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct PriceEvent {
+#[derive(Debug, Clone)]
+pub struct PriceTick {
     pub symbol: Symbol,
     pub price: f64,
-    pub volume_24h: f64,
     pub timestamp: DateTime<Utc>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct FundingEvent {
+#[derive(Debug, Clone)]
+pub struct TradeTick {
+    pub symbol: Symbol,
+    pub price: f64,
+    pub size: f64,
+    pub side: Direction,
+    pub timestamp: DateTime<Utc>,
+}
+
+#[derive(Debug, Clone)]
+pub struct OrderBookSnapshot {
+    pub symbol: Symbol,
+    pub bids: Vec<(f64, f64)>, // (price, size)
+    pub asks: Vec<(f64, f64)>,
+    pub timestamp: DateTime<Utc>,
+}
+
+#[derive(Debug, Clone)]
+pub struct FundingTick {
     pub symbol: Symbol,
     pub rate: f64,
     pub timestamp: DateTime<Utc>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct LiquidationEvent {
+#[derive(Debug, Clone)]
+pub struct LiquidationTick {
     pub symbol: Symbol,
     pub direction: Direction,
     pub size_usd: f64,
@@ -91,132 +79,157 @@ pub struct LiquidationEvent {
     pub timestamp: DateTime<Utc>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct OpenInterestEvent {
-    pub symbol: Symbol,
-    pub oi_usd: f64,
-    pub change_pct: f64,
+/// Candle (OHLCV) for indicator computation.
+#[derive(Debug, Clone)]
+pub struct Candle {
+    pub open: f64,
+    pub high: f64,
+    pub low: f64,
+    pub close: f64,
+    pub volume: f64,
     pub timestamp: DateTime<Utc>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct OnChainEvent {
-    pub metric: String, // e.g. "MVRV", "NUPL", "Puell"
-    pub value: f64,
-    pub timestamp: DateTime<Utc>,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct TextEvent {
-    pub source: String,
-    pub headline: String,
-    pub sentiment: f64,  // -1.0 to 1.0
-    pub urgency: f64,    // 0.0 to 1.0
-    pub dedup_hash: u64,
-    pub timestamp: DateTime<Utc>,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct DrawdownEvent {
-    pub current_drawdown_pct: f64,
-    pub threshold_pct: f64,
-    pub timestamp: DateTime<Utc>,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct MacroEvent {
-    pub event_name: String, // e.g. "FOMC", "CPI"
-    pub scheduled_at: DateTime<Utc>,
-    pub impact: MacroImpact,
-}
-
-#[derive(Debug, Clone, Copy, Serialize, Deserialize)]
-pub enum MacroImpact {
-    Low,
-    Medium,
-    High,
-}
-
-// ---------------------------------------------------------------------------
-// Trade proposal & decision
-// ---------------------------------------------------------------------------
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct TradeProposal {
-    pub id: Uuid,
-    pub proposer: AgentName,
-    pub symbol: Symbol,
-    pub direction: Direction,
-    pub size_usd: f64,
-    pub leverage: f64,
-    pub entry_price: f64,
-    pub stop_loss: f64,
-    pub take_profit: f64,
-    pub rationale: String,
-    pub signals: Vec<String>,
+/// Polymarket binary market odds.
+#[derive(Debug, Clone)]
+pub struct PmOdds {
+    pub market_id: String,
+    pub window: PmWindow,
+    pub up_price: f64,
+    pub down_price: f64,
     pub timestamp: DateTime<Utc>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-pub enum Verdict {
-    Accept,
-    Reject,
-    Adjust,
+pub enum PmWindow {
+    FiveMin,
+    FifteenMin,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct TradeDecision {
-    pub proposal: TradeProposal,
-    pub verdict: Verdict,
-    pub reason: String,
-    pub adjusted_size: Option<f64>,
-    pub adjusted_leverage: Option<f64>,
+impl std::fmt::Display for PmWindow {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            PmWindow::FiveMin => write!(f, "5m"),
+            PmWindow::FifteenMin => write!(f, "15m"),
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Unified market data event (sent through channels)
+// ---------------------------------------------------------------------------
+
+#[derive(Debug, Clone)]
+pub enum MarketEvent {
+    Price(PriceTick),
+    Trade(TradeTick),
+    OrderBook(OrderBookSnapshot),
+    Funding(FundingTick),
+    Liquidation(LiquidationTick),
+    PmOdds(PmOdds),
+}
+
+// ---------------------------------------------------------------------------
+// Signal engine types
+// ---------------------------------------------------------------------------
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum SignalLevel {
+    StrongLong,
+    LeanLong,
+    Weak,
+    LeanShort,
+    StrongShort,
+    NoTrade,
+}
+
+impl std::fmt::Display for SignalLevel {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            SignalLevel::StrongLong => write!(f, "STRONG_LONG"),
+            SignalLevel::LeanLong => write!(f, "LEAN_LONG"),
+            SignalLevel::Weak => write!(f, "WEAK"),
+            SignalLevel::LeanShort => write!(f, "LEAN_SHORT"),
+            SignalLevel::StrongShort => write!(f, "STRONG_SHORT"),
+            SignalLevel::NoTrade => write!(f, "NO_TRADE"),
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct SignalSnapshot {
+    pub bull_score: i32,
+    pub bear_score: i32,
+    pub net_score: i32,
+    pub level: SignalLevel,
+    pub filter_reason: Option<String>,
+    pub indicators: IndicatorValues,
     pub timestamp: DateTime<Utc>,
 }
 
+#[derive(Debug, Clone, Default)]
+pub struct IndicatorValues {
+    pub ema_9: Option<f64>,
+    pub ema_21: Option<f64>,
+    pub rsi_14: Option<f64>,
+    pub stoch_rsi: Option<f64>,
+    pub bb_upper: Option<f64>,
+    pub bb_lower: Option<f64>,
+    pub bb_squeeze: bool,
+    pub atr_14: Option<f64>,
+    pub atr_pct: Option<f64>,
+    pub cvd: Option<f64>,
+    pub ob_imbalance: Option<f64>,
+    pub pm_divergence: Option<f64>,
+}
+
 // ---------------------------------------------------------------------------
-// Portfolio state
+// Play types & LLM decisions (Phase 2 types, defined for completeness)
 // ---------------------------------------------------------------------------
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum PlayType {
+    PurePerpScalp,
+    PureBinaryBet,
+    HedgedPerp,
+    BinaryArbitrage,
+    CrossMarketMomentum,
+}
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct Position {
-    pub id: Uuid,
-    pub proposer: AgentName,
-    pub symbol: Symbol,
-    pub direction: Direction,
-    pub size_usd: f64,
-    pub leverage: f64,
-    pub entry_price: f64,
-    pub stop_loss: f64,
-    pub take_profit: f64,
-    pub opened_at: DateTime<Utc>,
-    pub unrealized_pnl: f64,
+pub enum LlmDecision {
+    Execute {
+        play_type: PlayType,
+        direction: Direction,
+        size_pct: f64,
+        hl_leverage: Option<u8>,
+        stop_loss_pct: f64,
+        take_profit_pct: f64,
+        pm_hedge: Option<PmHedge>,
+        reasoning: String,
+    },
+    Skip {
+        reasoning: String,
+    },
+    SecondLook {
+        recheck_after_secs: u64,
+        what_to_watch: String,
+        original_bias: Direction,
+        reasoning: String,
+    },
 }
 
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
-pub struct Portfolio {
-    pub total_equity_usd: f64,
-    pub free_cash_usd: f64,
-    pub positions: Vec<Position>,
-    pub realized_pnl: f64,
-    pub peak_equity: f64,
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PmHedge {
+    pub side: BinarySide,
+    pub budget_usd: f64,
+    pub max_price: f64,
 }
 
-impl Portfolio {
-    pub fn drawdown_pct(&self) -> f64 {
-        if self.peak_equity <= 0.0 {
-            return 0.0;
-        }
-        ((self.peak_equity - self.total_equity_usd) / self.peak_equity) * 100.0
-    }
-
-    pub fn agent_exposure(&self, agent: AgentName) -> f64 {
-        self.positions
-            .iter()
-            .filter(|p| p.proposer == agent)
-            .map(|p| p.size_usd)
-            .sum()
-    }
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum BinarySide {
+    Up,
+    Down,
 }
 
 // ---------------------------------------------------------------------------
@@ -225,104 +238,27 @@ impl Portfolio {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum AgentStatus {
-    Active,
-    Watching,
-    InTrade,
+    Scanning,
+    SignalDetected,
+    WaitingLlm,
+    Executing,
+    InPosition,
+    SecondLook,
     Paused,
-    KillSwitchTriggered,
+    KillSwitch,
 }
 
 impl std::fmt::Display for AgentStatus {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            AgentStatus::Active => write!(f, "ACTIVE"),
-            AgentStatus::Watching => write!(f, "WATCHING"),
-            AgentStatus::InTrade => write!(f, "IN TRADE"),
+            AgentStatus::Scanning => write!(f, "SCANNING"),
+            AgentStatus::SignalDetected => write!(f, "SIGNAL"),
+            AgentStatus::WaitingLlm => write!(f, "LLM..."),
+            AgentStatus::Executing => write!(f, "EXECUTING"),
+            AgentStatus::InPosition => write!(f, "IN POSITION"),
+            AgentStatus::SecondLook => write!(f, "2ND LOOK"),
             AgentStatus::Paused => write!(f, "PAUSED"),
-            AgentStatus::KillSwitchTriggered => write!(f, "KILLED"),
+            AgentStatus::KillSwitch => write!(f, "KILLED"),
         }
-    }
-}
-
-// ---------------------------------------------------------------------------
-// Risk limits (per agent)
-// ---------------------------------------------------------------------------
-
-#[derive(Debug, Clone)]
-pub struct RiskLimits {
-    pub max_leverage: f64,
-    pub max_per_trade_pct: f64,
-    pub max_total_exposure_pct: f64,
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    fn make_position(agent: AgentName, size: f64) -> Position {
-        Position {
-            id: Uuid::new_v4(),
-            proposer: agent,
-            symbol: Symbol::BTC,
-            direction: Direction::Long,
-            size_usd: size,
-            leverage: 1.0,
-            entry_price: 50000.0,
-            stop_loss: 47500.0,
-            take_profit: 55000.0,
-            opened_at: Utc::now(),
-            unrealized_pnl: 0.0,
-        }
-    }
-
-    #[test]
-    fn drawdown_pct_no_drawdown() {
-        let p = Portfolio {
-            total_equity_usd: 10000.0,
-            peak_equity: 10000.0,
-            ..Default::default()
-        };
-        assert!((p.drawdown_pct() - 0.0).abs() < f64::EPSILON);
-    }
-
-    #[test]
-    fn drawdown_pct_with_loss() {
-        let p = Portfolio {
-            total_equity_usd: 8500.0,
-            peak_equity: 10000.0,
-            ..Default::default()
-        };
-        assert!((p.drawdown_pct() - 15.0).abs() < f64::EPSILON);
-    }
-
-    #[test]
-    fn drawdown_pct_zero_peak() {
-        let p = Portfolio {
-            total_equity_usd: 0.0,
-            peak_equity: 0.0,
-            ..Default::default()
-        };
-        assert!((p.drawdown_pct() - 0.0).abs() < f64::EPSILON);
-    }
-
-    #[test]
-    fn agent_exposure_empty() {
-        let p = Portfolio::default();
-        assert!((p.agent_exposure(AgentName::MidTerm) - 0.0).abs() < f64::EPSILON);
-    }
-
-    #[test]
-    fn agent_exposure_filters_by_agent() {
-        let p = Portfolio {
-            positions: vec![
-                make_position(AgentName::MidTerm, 500.0),
-                make_position(AgentName::MidTerm, 300.0),
-                make_position(AgentName::ShortTerm, 200.0),
-            ],
-            ..Default::default()
-        };
-        assert!((p.agent_exposure(AgentName::MidTerm) - 800.0).abs() < f64::EPSILON);
-        assert!((p.agent_exposure(AgentName::ShortTerm) - 200.0).abs() < f64::EPSILON);
-        assert!((p.agent_exposure(AgentName::LongTerm) - 0.0).abs() < f64::EPSILON);
     }
 }

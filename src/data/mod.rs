@@ -1,4 +1,3 @@
-pub mod coinglass;
-pub mod glassnode;
 pub mod hyperliquid;
-pub mod macro_sources;
+pub mod news;
+pub mod polymarket;

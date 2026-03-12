@@ -1,110 +1,108 @@
-use crate::types::{AgentName, RiskLimits};
 use anyhow::{Context, Result};
+use serde::Deserialize;
 use std::collections::HashMap;
 
+/// Secrets loaded from .env
 #[derive(Debug, Clone)]
-pub struct Config {
-    pub private_key: String,
-    pub coinglass_api_key: String,
-    pub glassnode_api_key: String,
+pub struct Secrets {
+    pub hl_private_key: String,
+    pub pm_private_key: String,
     pub anthropic_api_key: String,
-    pub is_mainnet: bool,
-    pub kill_switch_drawdown_pct: f64,
-    pub whitelisted_symbols: Vec<String>,
-    pub risk_limits: HashMap<AgentName, RiskLimits>,
 }
 
-impl Config {
+impl Secrets {
     pub fn from_env() -> Result<Self> {
         dotenvy::dotenv().ok();
-
-        let mut risk_limits = HashMap::new();
-
-        risk_limits.insert(
-            AgentName::LongTerm,
-            RiskLimits {
-                max_leverage: 2.0,
-                max_per_trade_pct: 6.0,
-                max_total_exposure_pct: 100.0, // unlimited when unleveraged
-            },
-        );
-
-        risk_limits.insert(
-            AgentName::MidTerm,
-            RiskLimits {
-                max_leverage: 5.0,
-                max_per_trade_pct: 5.0,
-                max_total_exposure_pct: 20.0,
-            },
-        );
-
-        risk_limits.insert(
-            AgentName::ShortTerm,
-            RiskLimits {
-                max_leverage: 20.0,
-                max_per_trade_pct: 2.0,
-                max_total_exposure_pct: 10.0,
-            },
-        );
-
-        Ok(Config {
-            private_key: std::env::var("PRIVATE_KEY")
-                .context("PRIVATE_KEY must be set in .env")?,
-            coinglass_api_key: std::env::var("COINGLASS_API_KEY").unwrap_or_default(),
-            glassnode_api_key: std::env::var("GLASSNODE_API_KEY").unwrap_or_default(),
+        Ok(Self {
+            hl_private_key: std::env::var("HL_PRIVATE_KEY")
+                .context("HL_PRIVATE_KEY must be set in .env")?,
+            pm_private_key: std::env::var("PM_PRIVATE_KEY").unwrap_or_default(),
             anthropic_api_key: std::env::var("ANTHROPIC_API_KEY").unwrap_or_default(),
-            is_mainnet: std::env::var("HYPERLIQUID_MAINNET")
-                .unwrap_or_else(|_| "false".into())
-                .parse()
-                .context("Invalid HYPERLIQUID_MAINNET (expected true/false)")?,
-            kill_switch_drawdown_pct: std::env::var("KILL_SWITCH_DRAWDOWN_PCT")
-                .unwrap_or_else(|_| "15.0".into())
-                .parse()
-                .context("Invalid KILL_SWITCH_DRAWDOWN_PCT")?,
-            whitelisted_symbols: vec!["BTC".into(), "ETH".into()],
-            risk_limits,
         })
     }
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
+/// Full config loaded from config.toml
+#[derive(Debug, Clone, Deserialize)]
+pub struct Config {
+    pub capital: CapitalConfig,
+    pub hyperliquid: HlConfig,
+    pub polymarket: PmConfig,
+    pub execution: ExecutionConfig,
+    pub sessions: HashMap<String, SessionConfig>,
+    pub llm: LlmConfig,
+    pub signals: SignalConfig,
+}
 
-    #[test]
-    fn default_risk_limits_correct() {
-        // Set required env var for Config::from_env
-        std::env::set_var("PRIVATE_KEY", "0x0000000000000000000000000000000000000001");
-        let config = Config::from_env().unwrap();
+#[derive(Debug, Clone, Deserialize)]
+pub struct CapitalConfig {
+    pub initial_usd: f64,
+    pub max_trade_pct: f64,
+    pub max_concurrent_positions: u32,
+    pub max_daily_loss_pct: f64,
+    pub kill_switch_drawdown_pct: f64,
+}
 
-        let lt = config.risk_limits.get(&AgentName::LongTerm).unwrap();
-        assert!((lt.max_leverage - 2.0).abs() < f64::EPSILON);
-        assert!((lt.max_per_trade_pct - 6.0).abs() < f64::EPSILON);
-        assert!((lt.max_total_exposure_pct - 100.0).abs() < f64::EPSILON);
+#[derive(Debug, Clone, Deserialize)]
+pub struct HlConfig {
+    pub max_leverage: u8,
+}
 
-        let mt = config.risk_limits.get(&AgentName::MidTerm).unwrap();
-        assert!((mt.max_leverage - 5.0).abs() < f64::EPSILON);
-        assert!((mt.max_per_trade_pct - 5.0).abs() < f64::EPSILON);
-        assert!((mt.max_total_exposure_pct - 20.0).abs() < f64::EPSILON);
+#[derive(Debug, Clone, Deserialize)]
+pub struct PmConfig {
+    pub max_bet_usd: f64,
+    pub max_hedge_ratio: f64,
+    pub prefer_maker_orders: bool,
+    pub min_window_remaining_secs: u64,
+}
 
-        let st = config.risk_limits.get(&AgentName::ShortTerm).unwrap();
-        assert!((st.max_leverage - 20.0).abs() < f64::EPSILON);
-        assert!((st.max_per_trade_pct - 2.0).abs() < f64::EPSILON);
-        assert!((st.max_total_exposure_pct - 10.0).abs() < f64::EPSILON);
+#[derive(Debug, Clone, Deserialize)]
+pub struct ExecutionConfig {
+    pub max_trade_duration_secs: u64,
+    pub max_second_looks: u32,
+    pub signal_eval_interval_secs: u64,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct SessionConfig {
+    pub start: String,
+    pub end: String,
+    pub size_mult: f64,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct LlmConfig {
+    pub model: String,
+    pub timeout_ms: u64,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct SignalConfig {
+    pub strong_threshold: i32,
+    pub lean_threshold: i32,
+    pub min_atr_pct: f64,
+    pub max_funding_same_dir: f64,
+}
+
+impl Config {
+    pub fn load(path: &str) -> Result<Self> {
+        let content = std::fs::read_to_string(path)
+            .with_context(|| format!("Failed to read config file: {}", path))?;
+        let config: Config =
+            toml::from_str(&content).context("Failed to parse config.toml")?;
+        Ok(config)
     }
 
-    #[test]
-    fn whitelisted_symbols() {
-        std::env::set_var("PRIVATE_KEY", "0x0000000000000000000000000000000000000001");
-        let config = Config::from_env().unwrap();
-        assert_eq!(config.whitelisted_symbols, vec!["BTC", "ETH"]);
-    }
+    /// Check if we're in an active trading session. Returns (in_session, size_multiplier).
+    pub fn active_session(&self) -> (bool, f64) {
+        let now = chrono::Utc::now();
+        let hour_min = now.format("%H:%M").to_string();
 
-    #[test]
-    fn default_kill_switch_pct() {
-        std::env::set_var("PRIVATE_KEY", "0x0000000000000000000000000000000000000001");
-        std::env::remove_var("KILL_SWITCH_DRAWDOWN_PCT");
-        let config = Config::from_env().unwrap();
-        assert!((config.kill_switch_drawdown_pct - 15.0).abs() < f64::EPSILON);
+        for session in self.sessions.values() {
+            if hour_min >= session.start && hour_min < session.end {
+                return (true, session.size_mult);
+            }
+        }
+        (false, 0.0)
     }
 }

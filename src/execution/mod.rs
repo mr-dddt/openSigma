@@ -1,3 +1,4 @@
 pub mod hyperliquid;
-pub mod hyperliquid_signer;
-pub mod hyperliquid_types;
+pub mod kill_switch;
+pub mod polymarket;
+pub mod risk;

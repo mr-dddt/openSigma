@@ -1,117 +1,99 @@
-use anyhow::Result;
-use crossterm::{
-    event::{self, Event as CrosstermEvent, KeyCode, KeyEventKind},
-    terminal::{disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen},
-    ExecutableCommand,
-};
 use ratatui::{
     prelude::*,
     widgets::{Block, Borders, List, ListItem, Paragraph},
 };
-use std::io::stdout;
-use tokio::sync::mpsc;
-use tracing::info;
 
 use crate::types::*;
 
 pub struct App {
-    portfolio: Portfolio,
-    agent_statuses: Vec<(AgentName, AgentStatus)>,
-    trade_log: Vec<String>,
-    memory_lines: Vec<String>,
-    show_memory: bool,
-    should_quit: bool,
-    kill_switch_tx: mpsc::Sender<()>,
+    // State
+    pub status: AgentStatus,
+    pub btc_price: f64,
+    pub latest_signal: Option<SignalSnapshot>,
+    pub trade_log: Vec<String>,
+    pub equity: f64,
+    pub daily_pnl: f64,
 }
 
 impl App {
-    pub fn new(kill_switch_tx: mpsc::Sender<()>) -> Self {
+    pub fn new(initial_equity: f64) -> Self {
         Self {
-            portfolio: Portfolio::default(),
-            agent_statuses: vec![
-                (AgentName::WatchDog, AgentStatus::Active),
-                (AgentName::LongTerm, AgentStatus::Watching),
-                (AgentName::MidTerm, AgentStatus::Watching),
-                (AgentName::ShortTerm, AgentStatus::Watching),
-            ],
+            status: AgentStatus::Scanning,
+            btc_price: 0.0,
+            latest_signal: None,
             trade_log: Vec::new(),
-            memory_lines: Vec::new(),
-            show_memory: false,
-            should_quit: false,
-            kill_switch_tx,
+            equity: initial_equity,
+            daily_pnl: 0.0,
         }
     }
 
-    pub async fn run(&mut self) -> Result<()> {
-        enable_raw_mode()?;
-        stdout().execute(EnterAlternateScreen)?;
-        let mut terminal = Terminal::new(CrosstermBackend::new(stdout()))?;
-
-        info!("TUI started");
-
-        while !self.should_quit {
-            terminal.draw(|frame| self.render(frame))?;
-
-            if event::poll(std::time::Duration::from_millis(100))? {
-                if let CrosstermEvent::Key(key) = event::read()? {
-                    if key.kind == KeyEventKind::Press {
-                        match key.code {
-                            KeyCode::Char('q') => self.should_quit = true,
-                            KeyCode::Char('k') => {
-                                let _ = self.kill_switch_tx.send(()).await;
-                            }
-                            KeyCode::Char('m') => self.show_memory = !self.show_memory,
-                            _ => {}
-                        }
-                    }
-                }
-            }
-        }
-
-        disable_raw_mode()?;
-        stdout().execute(LeaveAlternateScreen)?;
-        Ok(())
+    pub fn update_price(&mut self, price: f64) {
+        self.btc_price = price;
     }
 
-    fn render(&self, frame: &mut Frame) {
+    pub fn update_signal(&mut self, signal: SignalSnapshot) {
+        self.status = if signal.level == SignalLevel::NoTrade || signal.level == SignalLevel::Weak {
+            AgentStatus::Scanning
+        } else {
+            AgentStatus::SignalDetected
+        };
+        self.latest_signal = Some(signal);
+    }
+
+    pub fn push_log(&mut self, line: String) {
+        self.trade_log.push(line);
+    }
+
+    pub fn render_frame(&self, frame: &mut Frame) {
         let chunks = Layout::default()
             .direction(ratatui::layout::Direction::Vertical)
             .constraints([
-                Constraint::Length(8),  // portfolio + agent status
-                Constraint::Min(10),   // trade log
-                Constraint::Length(6), // memory / footer
+                Constraint::Length(7),
+                Constraint::Min(10),
+                Constraint::Length(3),
             ])
             .split(frame.area());
 
-        // Top: Portfolio + Agent Status side by side
+        // Top: status + signal side by side
         let top_chunks = Layout::default()
             .direction(ratatui::layout::Direction::Horizontal)
             .constraints([Constraint::Percentage(40), Constraint::Percentage(60)])
             .split(chunks[0]);
 
-        // Portfolio panel
-        let portfolio_text = format!(
-            " Equity:   ${:.2}\n Free:     ${:.2}\n PnL:      ${:.2}\n Drawdown: {:.1}%",
-            self.portfolio.total_equity_usd,
-            self.portfolio.free_cash_usd,
-            self.portfolio.realized_pnl,
-            self.portfolio.drawdown_pct(),
+        // Left: portfolio info
+        let status_text = format!(
+            " BTC:      ${:.2}\n Status:   [{}]\n Equity:   ${:.2}\n Daily PnL: {}{:.2}%",
+            self.btc_price,
+            self.status,
+            self.equity,
+            if self.daily_pnl >= 0.0 { "+" } else { "" },
+            self.daily_pnl,
         );
-        let portfolio_block = Paragraph::new(portfolio_text)
-            .block(Block::default().borders(Borders::ALL).title(" Portfolio "));
-        frame.render_widget(portfolio_block, top_chunks[0]);
+        let status_block = Paragraph::new(status_text)
+            .block(Block::default().borders(Borders::ALL).title(" openSigma v2 "));
+        frame.render_widget(status_block, top_chunks[0]);
 
-        // Agent status panel
-        let agent_items: Vec<ListItem> = self
-            .agent_statuses
-            .iter()
-            .map(|(name, status)| ListItem::new(format!("  {:<12} [{}]", name, status)))
-            .collect();
-        let agent_list = List::new(agent_items)
-            .block(Block::default().borders(Borders::ALL).title(" Agents "));
-        frame.render_widget(agent_list, top_chunks[1]);
+        // Right: signal info
+        let signal_text = if let Some(ref sig) = self.latest_signal {
+            let filter = sig.filter_reason.as_deref().unwrap_or("none");
+            format!(
+                " Level: {}\n Score: bull={} bear={} net={}\n EMA: 9={:.0} 21={:.0}\n Filter: {}",
+                sig.level,
+                sig.bull_score,
+                sig.bear_score,
+                sig.net_score,
+                sig.indicators.ema_9.unwrap_or(0.0),
+                sig.indicators.ema_21.unwrap_or(0.0),
+                filter,
+            )
+        } else {
+            " Waiting for data...".to_string()
+        };
+        let signal_block = Paragraph::new(signal_text)
+            .block(Block::default().borders(Borders::ALL).title(" Signal "));
+        frame.render_widget(signal_block, top_chunks[1]);
 
-        // Middle: Trade log
+        // Middle: trade log
         let log_items: Vec<ListItem> = self
             .trade_log
             .iter()
@@ -120,48 +102,12 @@ impl App {
             .map(|line| ListItem::new(line.as_str()))
             .collect();
         let log_list = List::new(log_items)
-            .block(Block::default().borders(Borders::ALL).title(" Trade Log "));
+            .block(Block::default().borders(Borders::ALL).title(" Log "));
         frame.render_widget(log_list, chunks[1]);
 
-        // Bottom: Memory or keybindings
-        let bottom_text = if self.show_memory {
-            self.memory_lines
-                .iter()
-                .rev()
-                .take(4)
-                .cloned()
-                .collect::<Vec<_>>()
-                .join("\n")
-        } else {
-            " [q] quit  [k] kill switch  [m] toggle memory".to_string()
-        };
-        let bottom_title = if self.show_memory {
-            " Memory "
-        } else {
-            " Keys "
-        };
-        let bottom_block = Paragraph::new(bottom_text)
-            .block(Block::default().borders(Borders::ALL).title(bottom_title));
-        frame.render_widget(bottom_block, chunks[2]);
-    }
-
-    // --- Update methods called from main loop ---
-
-    pub fn update_portfolio(&mut self, portfolio: Portfolio) {
-        self.portfolio = portfolio;
-    }
-
-    pub fn update_agent_status(&mut self, name: AgentName, status: AgentStatus) {
-        if let Some(entry) = self.agent_statuses.iter_mut().find(|(n, _)| *n == name) {
-            entry.1 = status;
-        }
-    }
-
-    pub fn push_trade_log(&mut self, line: String) {
-        self.trade_log.push(line);
-    }
-
-    pub fn set_memory(&mut self, content: &str) {
-        self.memory_lines = content.lines().map(|l| l.to_string()).collect();
+        // Bottom: keybindings
+        let footer = Paragraph::new(" [q] quit  [k] kill switch")
+            .block(Block::default().borders(Borders::ALL));
+        frame.render_widget(footer, chunks[2]);
     }
 }
