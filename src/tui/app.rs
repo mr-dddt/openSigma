@@ -37,6 +37,7 @@ pub struct App {
     pub btc_price: f64,
     pub latest_signal: Option<SignalSnapshot>,
     pub trade_log: Vec<String>,
+    pub initial_equity: f64,
     pub equity: f64,
     pub daily_pnl: f64,
     // Phase 3 additions
@@ -51,6 +52,7 @@ impl App {
             btc_price: 0.0,
             latest_signal: None,
             trade_log: Vec::new(),
+            initial_equity,
             equity: initial_equity,
             daily_pnl: 0.0,
             positions: Vec::new(),
@@ -83,6 +85,10 @@ impl App {
     }
 
     pub fn update_stats(&mut self, stats: PerformanceStats) {
+        self.equity = self.initial_equity + stats.total_pnl;
+        if self.initial_equity > 0.0 {
+            self.daily_pnl = (stats.total_pnl / self.initial_equity) * 100.0;
+        }
         self.stats = stats;
     }
 

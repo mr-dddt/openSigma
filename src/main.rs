@@ -360,6 +360,7 @@ async fn main() -> Result<()> {
                                     &decision, &sl_snapshot, &cfg,
                                     &mut risk, &mut position_monitor, &mut second_look,
                                     &mut tuner, &hl_executor, &journal, &tui_tx_clone,
+                                    &telegram,
                                 ).await;
                             }
                             Err(e) => warn!("SecondLook LLM error: {e:#}"),
@@ -390,6 +391,7 @@ async fn main() -> Result<()> {
                                         &decision, &snapshot, &cfg,
                                         &mut risk, &mut position_monitor, &mut second_look,
                                         &mut tuner, &hl_executor, &journal, &tui_tx_clone,
+                                        &telegram,
                                     ).await;
                                 }
                                 Err(e) => {
@@ -552,6 +554,7 @@ async fn handle_llm_decision(
     hl_executor: &Option<HlExecutor>,
     journal: &TradeLogger,
     tui_tx: &mpsc::Sender<TuiUpdate>,
+    telegram: &Option<TelegramClient>,
 ) {
     match decision {
         LlmDecision::Execute {
@@ -668,6 +671,17 @@ async fn handle_llm_decision(
                 capital_after: None,
             };
             let _ = journal.log_entry(&open_record);
+
+            // Telegram alert on trade open
+            if let Some(ref tg) = telegram {
+                let tg_ref = tg.clone();
+                let pt = *play_type;
+                let dir = *direction;
+                let reason = reasoning.clone();
+                tokio::spawn(async move {
+                    tg_ref.send_trade_open(pt, dir, size_usd, entry_price, leverage, &reason).await;
+                });
+            }
 
             let _ = tui_tx.send(TuiUpdate::Log(format!(
                 "[{}] EXECUTE {} {} ${:.0} @{:.0} lev={} — {}",

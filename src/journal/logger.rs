@@ -35,7 +35,9 @@ impl TradeLogger {
         Ok(())
     }
 
-    /// Read the most recent N trade records.
+    /// Read the most recent N *closed* trade records (ts_close is Some).
+    /// Open entries (journaled on position open) are filtered out to avoid
+    /// polluting metrics with phantom $0 PnL "wins".
     pub fn read_recent(&self, n: usize) -> Result<Vec<TradeRecord>> {
         let file = match std::fs::File::open(&self.path) {
             Ok(f) => f,
@@ -48,10 +50,11 @@ impl TradeLogger {
         let mut records: Vec<TradeRecord> = all_lines
             .iter()
             .rev()
+            .filter_map(|line| serde_json::from_str::<TradeRecord>(line).ok())
+            .filter(|r| r.ts_close.is_some())
             .take(n)
-            .filter_map(|line| serde_json::from_str(line).ok())
             .collect();
-        records.reverse(); // chronological order
+        records.reverse();
 
         Ok(records)
     }
