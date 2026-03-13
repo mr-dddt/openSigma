@@ -161,7 +161,9 @@ impl Config {
         Ok(config)
     }
 
-    /// Check if we're in an active trading session. Returns (in_session, size_multiplier).
+    /// Check if we're in a named trading session. Returns (in_session, size_multiplier).
+    /// Off-session hours get a default 0.3x size mult — still tradeable, just smaller.
+    /// BTC is liquid 24/7; sessions control sizing, not access.
     pub fn active_session(&self) -> (bool, f64) {
         let now = chrono::Utc::now().time();
         for session in self.sessions.values() {
@@ -178,6 +180,6 @@ impl Config {
                 return (true, session.size_mult);
             }
         }
-        (false, 0.0)
+        (false, 0.3) // off-session: reduced size, not blocked
     }
 }

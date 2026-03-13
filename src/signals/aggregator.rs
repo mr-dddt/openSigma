@@ -241,11 +241,10 @@ impl SignalAggregator {
             return Some("News circuit breaker ON".into());
         }
 
-        // Asia session (00:00–07:00 UTC)
-        let hour = Utc::now().time().hour();
-        if hour < 7 {
-            return Some("Asia session (low vol)".into());
-        }
+        // No time-of-day hard block — BTC is liquid 24/7.
+        // Off-peak hours are handled via session size_mult in config.toml
+        // (e.g., London 0.4x, Late NY 0.6x). The LLM sees session context
+        // and the ATR filter catches genuinely dead markets.
 
         // Daily loss limit
         if self.daily_pnl_pct <= -config.capital.max_daily_loss_pct {
@@ -278,7 +277,6 @@ impl SignalAggregator {
     }
 }
 
-use chrono::Timelike;
 use crate::config::SignalConfig;
 
 fn classify_level(net: i32, cfg: &SignalConfig) -> SignalLevel {
