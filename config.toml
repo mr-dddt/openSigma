@@ -6,7 +6,7 @@ max_daily_loss_pct = 10.0
 kill_switch_drawdown_pct = 20.0
 
 [hyperliquid]
-max_leverage = 15
+max_leverage = 50
 
 [polymarket]
 max_bet_usd = 50.0
