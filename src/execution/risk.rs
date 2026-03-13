@@ -1,8 +1,8 @@
 use crate::config::Config;
+use crate::types::LlmDecision;
 use tracing::warn;
 
 /// Hard risk checks that the LLM cannot override.
-/// Phase 2: full implementation with position tracking.
 pub struct RiskChecker {
     daily_loss_usd: f64,
     peak_equity: f64,
@@ -22,7 +22,6 @@ impl RiskChecker {
 
     /// Check if a new trade is allowed.
     pub fn can_trade(&self, config: &Config) -> Result<(), String> {
-        // Max concurrent positions
         if self.open_positions >= config.capital.max_concurrent_positions {
             return Err(format!(
                 "Max {} concurrent positions reached",
@@ -30,13 +29,14 @@ impl RiskChecker {
             ));
         }
 
-        // Daily loss limit
         let daily_loss_pct = (self.daily_loss_usd / config.capital.initial_usd) * 100.0;
         if daily_loss_pct >= config.capital.max_daily_loss_pct {
-            return Err(format!("Daily loss {:.1}% >= {:.1}% limit", daily_loss_pct, config.capital.max_daily_loss_pct));
+            return Err(format!(
+                "Daily loss {:.1}% >= {:.1}% limit",
+                daily_loss_pct, config.capital.max_daily_loss_pct
+            ));
         }
 
-        // Kill switch (drawdown from peak)
         let drawdown_pct = if self.peak_equity > 0.0 {
             ((self.peak_equity - self.current_equity) / self.peak_equity) * 100.0
         } else {
@@ -50,8 +50,76 @@ impl RiskChecker {
         Ok(())
     }
 
+    /// Validate an LLM Execute decision against hard limits.
+    pub fn validate_decision(&self, decision: &LlmDecision, config: &Config) -> Result<(), String> {
+        if let LlmDecision::Execute {
+            size_pct,
+            hl_leverage,
+            ..
+        } = decision
+        {
+            if *size_pct > config.capital.max_trade_pct {
+                return Err(format!(
+                    "LLM size {:.1}% exceeds max {:.1}%",
+                    size_pct, config.capital.max_trade_pct
+                ));
+            }
+            if let Some(lev) = hl_leverage {
+                if *lev > config.hyperliquid.max_leverage {
+                    return Err(format!(
+                        "LLM leverage {} exceeds max {}",
+                        lev, config.hyperliquid.max_leverage
+                    ));
+                }
+            }
+        }
+        Ok(())
+    }
+
     /// Max trade size in USD based on config.
     pub fn max_trade_usd(&self, config: &Config) -> f64 {
         self.current_equity * (config.capital.max_trade_pct / 100.0)
+    }
+
+    /// Update equity after a trade closes.
+    pub fn update_equity(&mut self, new_equity: f64) {
+        self.current_equity = new_equity;
+        if new_equity > self.peak_equity {
+            self.peak_equity = new_equity;
+        }
+    }
+
+    /// Record trade PnL for daily loss tracking.
+    pub fn record_trade_pnl(&mut self, pnl_usd: f64) {
+        if pnl_usd < 0.0 {
+            self.daily_loss_usd += pnl_usd.abs();
+        }
+        self.current_equity += pnl_usd;
+        if self.current_equity > self.peak_equity {
+            self.peak_equity = self.current_equity;
+        }
+    }
+
+    pub fn set_open_positions(&mut self, count: u32) {
+        self.open_positions = count;
+    }
+
+    /// Check if kill switch should trigger based on drawdown.
+    pub fn should_kill(&self, config: &Config) -> bool {
+        if self.peak_equity <= 0.0 {
+            return false;
+        }
+        let drawdown_pct =
+            ((self.peak_equity - self.current_equity) / self.peak_equity) * 100.0;
+        drawdown_pct >= config.capital.kill_switch_drawdown_pct
+    }
+
+    pub fn current_equity(&self) -> f64 {
+        self.current_equity
+    }
+
+    pub fn daily_pnl_pct(&self, config: &Config) -> f64 {
+        let pnl = self.current_equity - config.capital.initial_usd;
+        (pnl / config.capital.initial_usd) * 100.0
     }
 }

@@ -7,34 +7,82 @@ mod signals;
 mod tui;
 mod types;
 
-use anyhow::Result;
-use tokio::sync::mpsc;
-use tracing::info;
+use std::sync::Arc;
 
+use anyhow::Result;
+use crossterm::ExecutableCommand;
+use tokio::sync::{mpsc, RwLock};
+use tracing::{error, info, warn};
+use uuid::Uuid;
+
+use crate::agent::llm_client::LlmClient;
+use crate::agent::llm_gate::LlmGate;
+use crate::agent::second_look::SecondLookScheduler;
+use crate::agent::tuner::SignalTuner;
 use crate::config::{Config, Secrets};
 use crate::data::hyperliquid::HyperliquidFeed;
 use crate::data::news::NewsFeed;
 use crate::data::polymarket::PolymarketFeed;
+use crate::execution::hyperliquid::HlExecutor;
+use crate::execution::kill_switch::KillSwitch;
+use crate::execution::polymarket::PmExecutor;
+use crate::execution::position_monitor::{PositionEvent, PositionMonitor};
+use crate::execution::risk::RiskChecker;
+use crate::journal::logger::TradeLogger;
+use crate::journal::memory::MemoryManager;
 use crate::signals::aggregator::SignalAggregator;
 use crate::signals::indicators::Indicators;
 use crate::tui::app::App;
 use crate::types::*;
 
+const TUNE_SYSTEM_PROMPT: &str = r#"You are openSigma's signal engine tuner. Analyze the recent trade history and current signal parameters, then suggest parameter adjustments to improve performance.
+
+Respond with ONLY a valid JSON object:
+{"adjustments":[{"param":"<name>","old_value":<current>,"new_value":<suggested>}],"reasoning":"..."}
+
+Tunable parameters:
+- ema_cross_weight (int, weight for EMA 9/21 crossover signal)
+- cvd_weight (int, weight for cumulative volume delta)
+- rsi_weight (int, weight for RSI signal)
+- ob_weight (int, weight for order book imbalance)
+- stoch_rsi_weight (int, weight for stochastic RSI)
+- strong_threshold (int, net score needed for STRONG signal)
+- lean_threshold (int, net score needed for LEAN signal)
+- rsi_oversold (float, RSI level considered oversold)
+- rsi_overbought (float, RSI level considered overbought)
+- min_atr_pct (float, minimum ATR% to allow trading)
+
+Rules:
+- Only suggest changes you are confident will improve performance
+- Provide clear reasoning based on the trade data
+- Keep adjustments small and conservative
+- If no changes needed, return empty adjustments array"#;
+
+enum TuiUpdate {
+    Price(f64),
+    Signal(SignalSnapshot),
+    Log(String),
+}
+
 #[tokio::main]
 async fn main() -> Result<()> {
-    // Initialize tracing
+    // Log to file to avoid interfering with TUI rendering
+    std::fs::create_dir_all("data").ok();
+    let log_file = std::fs::File::create("data/opensigma.log")?;
     tracing_subscriber::fmt()
         .with_env_filter(
             tracing_subscriber::EnvFilter::try_from_default_env()
                 .unwrap_or_else(|_| "opensigma=info".into()),
         )
+        .with_writer(log_file)
+        .with_ansi(false)
         .init();
 
-    info!("openSigma v2 starting...");
+    info!("openSigma v1 starting...");
 
-    // Load config
+    // Load config (shared via Arc<RwLock> for tuner writes)
     let config = Config::load("config.toml")?;
-    let _secrets = Secrets::from_env()?;
+    let secrets = Secrets::from_env()?;
 
     info!(
         capital = config.capital.initial_usd,
@@ -43,26 +91,55 @@ async fn main() -> Result<()> {
         "Config loaded"
     );
 
+    let shared_config = Arc::new(RwLock::new(config.clone()));
+
     // Channel for market events (all data feeds → signal engine)
     let (market_tx, mut market_rx) = mpsc::channel::<MarketEvent>(2048);
 
-    // Spawn Hyperliquid WebSocket feed
+    // Spawn data feeds
     let hl_feed = HyperliquidFeed::new(market_tx.clone());
     tokio::spawn(async move { hl_feed.run().await });
 
-    // Spawn Polymarket feed (Phase 1 stub)
     let pm_feed = PolymarketFeed::new(market_tx.clone());
     tokio::spawn(async move { pm_feed.run().await });
 
-    // Spawn news feed (Phase 1 stub)
     let mut news_feed = NewsFeed::new();
     tokio::spawn(async move { news_feed.run().await });
 
-    // Signal aggregator
+    // Initialize components
     let mut aggregator = SignalAggregator::new();
-    let config_clone = config.clone();
+    let memory = MemoryManager::new("memory/memory.md");
+    let journal = TradeLogger::new("data/journal.jsonl");
 
-    // Signal evaluation interval
+    let llm_client = LlmClient::new(
+        secrets.anthropic_api_key.clone(),
+        config.llm.model.clone(),
+        config.llm.timeout_ms,
+    );
+    let llm_gate = LlmGate::new(llm_client, memory);
+
+    // Separate LLM client for tuning (avoids borrow conflicts)
+    let tune_client = LlmClient::new(
+        secrets.anthropic_api_key.clone(),
+        config.llm.model.clone(),
+        config.llm.timeout_ms * 3, // longer timeout for tuning
+    );
+
+    let mut second_look = SecondLookScheduler::new(config.execution.max_second_looks);
+    let mut tuner = SignalTuner::new(&config);
+    let mut risk = RiskChecker::new(config.capital.initial_usd);
+    let mut position_monitor = PositionMonitor::new();
+    let mut kill_switch = KillSwitch::new();
+
+    let hl_executor = match HlExecutor::new(&secrets.hl_private_key) {
+        Ok(ex) => Some(ex),
+        Err(e) => {
+            warn!("HlExecutor init failed (trading disabled): {e:#}");
+            None
+        }
+    };
+    let pm_executor = PmExecutor::new(&secrets.pm_private_key);
+
     let eval_interval =
         tokio::time::Duration::from_secs(config.execution.signal_eval_interval_secs);
     let mut eval_ticker = tokio::time::interval(eval_interval);
@@ -70,8 +147,9 @@ async fn main() -> Result<()> {
     // TUI update channel
     let (tui_tx, mut tui_rx) = mpsc::channel::<TuiUpdate>(256);
     let tui_tx_clone = tui_tx.clone();
+    let config_for_engine = shared_config.clone();
 
-    // Spawn the market event processor + signal engine
+    // Spawn the market event processor + signal engine + LLM gate
     tokio::spawn(async move {
         loop {
             tokio::select! {
@@ -81,11 +159,59 @@ async fn main() -> Result<()> {
                             aggregator.update_price(tick.price);
                             if tick.symbol == Symbol::BTC {
                                 let _ = tui_tx_clone.send(TuiUpdate::Price(tick.price)).await;
+
+                                // Check position price levels
+                                let events = position_monitor.check_price_levels(tick.price);
+                                for pe in events {
+                                    match pe {
+                                        PositionEvent::StopHit(id) | PositionEvent::TakeProfitHit(id) => {
+                                            let reason = match pe {
+                                                PositionEvent::StopHit(_) => "stop_loss",
+                                                PositionEvent::TakeProfitHit(_) => "take_profit",
+                                                _ => "unknown",
+                                            };
+                                            if let Some(trade) = position_monitor.remove_trade(&id) {
+                                                let pnl = position_monitor.unrealized_pnl(tick.price);
+                                                risk.record_trade_pnl(pnl);
+                                                tuner.record_trade();
+
+                                                let record = TradeRecord {
+                                                    id: trade.id,
+                                                    ts_open: trade.opened_at,
+                                                    ts_close: Some(chrono::Utc::now()),
+                                                    duration_secs: Some((chrono::Utc::now() - trade.opened_at).num_seconds() as u64),
+                                                    play_type: trade.play_type,
+                                                    direction: trade.direction,
+                                                    signal_level: trade.signal_level,
+                                                    signal_score: trade.signal_score,
+                                                    entry_price: trade.entry_price,
+                                                    exit_price: Some(tick.price),
+                                                    size_usd: trade.size_usd,
+                                                    leverage: trade.leverage,
+                                                    pnl_usd: Some(pnl),
+                                                    exit_reason: Some(reason.to_string()),
+                                                    llm_reasoning: trade.llm_reasoning.clone(),
+                                                    capital_after: Some(risk.current_equity()),
+                                                };
+                                                let _ = journal.log_entry(&record);
+
+                                                let _ = tui_tx_clone.send(TuiUpdate::Log(format!(
+                                                    "[{}] {} closed ({}) PnL: ${:.2}",
+                                                    chrono::Utc::now().format("%H:%M:%S"),
+                                                    trade.direction, reason, pnl,
+                                                ))).await;
+                                            }
+                                        }
+                                        _ => {}
+                                    }
+                                }
+                                risk.set_open_positions(position_monitor.open_count());
                             }
                         }
                         MarketEvent::Trade(trade) => {
                             let is_buy = trade.side == Direction::Long;
                             aggregator.indicators.add_trade(trade.size, is_buy);
+                            aggregator.push_trade_for_candles(trade.price, trade.size, trade.timestamp);
                         }
                         MarketEvent::OrderBook(book) => {
                             let imbalance = Indicators::ob_imbalance(&book.bids, &book.asks, 10);
@@ -101,22 +227,140 @@ async fn main() -> Result<()> {
                     }
                 }
                 _ = eval_ticker.tick() => {
-                    let snapshot = aggregator.evaluate(&config_clone);
+                    if kill_switch.triggered {
+                        continue;
+                    }
+
+                    let cfg = config_for_engine.read().await;
+                    let snapshot = aggregator.evaluate(&cfg);
                     let _ = tui_tx_clone.send(TuiUpdate::Signal(snapshot.clone())).await;
 
-                    // Phase 2: if filter passes, send to LLM gate
+                    // Check position expirations (max hold time)
+                    let expired = position_monitor.check_expirations();
+                    for id in expired {
+                        if let Some(trade) = position_monitor.remove_trade(&id) {
+                            info!(id = %trade.id, "Position expired (max hold time)");
+                            // Close via executor if available
+                            if let Some(ref hl) = hl_executor {
+                                let is_buy = trade.direction == Direction::Short;
+                                let sz = trade.size_usd / trade.entry_price;
+                                let _ = hl.market_order("BTC", is_buy, sz, trade.leverage.unwrap_or(1)).await;
+                            }
+                            let _ = tui_tx_clone.send(TuiUpdate::Log(format!(
+                                "[{}] Position {} expired — force closed",
+                                chrono::Utc::now().format("%H:%M:%S"),
+                                trade.id,
+                            ))).await;
+                        }
+                    }
+                    risk.set_open_positions(position_monitor.open_count());
+
+                    // Check SecondLook due entries
+                    let due_entries = second_look.poll_due();
+                    for entry in due_entries {
+                        info!(bias = %entry.original_bias, attempt = entry.attempt, "SecondLook re-evaluation");
+                        let sl_snapshot = aggregator.evaluate(&cfg);
+                        match llm_gate.evaluate(&sl_snapshot, &cfg).await {
+                            Ok(decision) => {
+                                handle_llm_decision(
+                                    &decision, &sl_snapshot, &cfg,
+                                    &mut risk, &mut position_monitor, &mut second_look,
+                                    &mut tuner, &hl_executor, &journal, &tui_tx_clone,
+                                ).await;
+                            }
+                            Err(e) => warn!("SecondLook LLM error: {e:#}"),
+                        }
+                    }
+
+                    // Main signal evaluation → LLM gate
                     if snapshot.level != SignalLevel::NoTrade && snapshot.level != SignalLevel::Weak {
-                        info!(
-                            level = %snapshot.level,
-                            score = snapshot.net_score,
-                            "Signal detected — would send to LLM (Phase 2)"
+                        tuner.record_signal_pass();
+
+                        if let Err(reason) = risk.can_trade(&cfg) {
+                            let _ = tui_tx_clone.send(TuiUpdate::Log(format!(
+                                "[{}] Risk block: {}",
+                                chrono::Utc::now().format("%H:%M:%S"),
+                                reason,
+                            ))).await;
+                        } else {
+                            let _ = tui_tx_clone.send(TuiUpdate::Log(format!(
+                                "[{}] {} (net={}) → LLM gate...",
+                                chrono::Utc::now().format("%H:%M:%S"),
+                                snapshot.level,
+                                snapshot.net_score,
+                            ))).await;
+
+                            match llm_gate.evaluate(&snapshot, &cfg).await {
+                                Ok(decision) => {
+                                    handle_llm_decision(
+                                        &decision, &snapshot, &cfg,
+                                        &mut risk, &mut position_monitor, &mut second_look,
+                                        &mut tuner, &hl_executor, &journal, &tui_tx_clone,
+                                    ).await;
+                                }
+                                Err(e) => {
+                                    warn!("LLM gate error: {e:#}");
+                                    let _ = tui_tx_clone.send(TuiUpdate::Log(format!(
+                                        "[{}] LLM error: {e}",
+                                        chrono::Utc::now().format("%H:%M:%S"),
+                                    ))).await;
+                                }
+                            }
+                        }
+                    }
+
+                    // Check tuning triggers
+                    if let Some(trigger) = tuner.should_tune() {
+                        info!(trigger = ?trigger, "Tuning triggered");
+                        let recent_trades = journal.read_recent(20).unwrap_or_default();
+                        let trades_summary: String = recent_trades.iter().map(|t| {
+                            format!("#{} {} {} pnl=${:.2} level={} score={}",
+                                t.id, t.direction, t.play_type,
+                                t.pnl_usd.unwrap_or(0.0), t.signal_level, t.signal_score)
+                        }).collect::<Vec<_>>().join("\n");
+
+                        let tune_context = format!(
+                            "Recent trades ({}):\n{}\n\nCurrent signal params:\n{}\n\nTrigger: {:?}",
+                            recent_trades.len(),
+                            if trades_summary.is_empty() { "No trades yet".to_string() } else { trades_summary },
+                            serde_json::to_string_pretty(&cfg.signals).unwrap_or_default(),
+                            trigger,
                         );
-                        let _ = tui_tx_clone.send(TuiUpdate::Log(format!(
-                            "[{}] {} (net={}) — LLM gate pending Phase 2",
-                            chrono::Utc::now().format("%H:%M:%S"),
-                            snapshot.level,
-                            snapshot.net_score,
-                        ))).await;
+
+                        drop(cfg); // Release read lock before write
+                        match tune_client.tune(TUNE_SYSTEM_PROMPT, &tune_context).await {
+                            Ok(tune_decision) => {
+                                let mut cfg_write = config_for_engine.write().await;
+                                tuner.apply_tune(&mut cfg_write, &tune_decision);
+                                let _ = tui_tx_clone.send(TuiUpdate::Log(format!(
+                                    "[{}] Signal engine tuned: {}",
+                                    chrono::Utc::now().format("%H:%M:%S"),
+                                    tune_decision.reasoning,
+                                ))).await;
+                            }
+                            Err(e) => {
+                                warn!("Tuning failed: {e:#}");
+                                tuner.mark_tuned(); // Reset timer to avoid retry spam
+                            }
+                        }
+                    } else {
+                        drop(cfg);
+                    }
+
+                    // Auto kill switch check
+                    {
+                        let cfg = config_for_engine.read().await;
+                        if risk.should_kill(&cfg) && !kill_switch.triggered {
+                            kill_switch.trigger();
+                            if let Some(ref hl) = hl_executor {
+                                let _ = hl.close_all().await;
+                            }
+                            let _ = pm_executor.cancel_all().await;
+                            let _ = tui_tx_clone.send(TuiUpdate::Log(format!(
+                                "[{}] KILL SWITCH — drawdown limit hit",
+                                chrono::Utc::now().format("%H:%M:%S"),
+                            ))).await;
+                        }
                     }
                 }
                 else => break,
@@ -135,7 +379,6 @@ async fn main() -> Result<()> {
     info!("All components initialized — entering main loop");
 
     loop {
-        // Drain pending TUI updates
         while let Ok(update) = tui_rx.try_recv() {
             match update {
                 TuiUpdate::Price(p) => app.update_price(p),
@@ -152,7 +395,7 @@ async fn main() -> Result<()> {
                     match key.code {
                         crossterm::event::KeyCode::Char('q') => break,
                         crossterm::event::KeyCode::Char('k') => {
-                            tracing::error!("KILL SWITCH activated");
+                            error!("KILL SWITCH activated by user");
                             break;
                         }
                         _ => {}
@@ -164,14 +407,157 @@ async fn main() -> Result<()> {
 
     crossterm::terminal::disable_raw_mode()?;
     std::io::stdout().execute(crossterm::terminal::LeaveAlternateScreen)?;
-    info!("openSigma v2 shutting down");
+    info!("openSigma v1 shutting down");
     Ok(())
 }
 
-use crossterm::ExecutableCommand;
+/// Handle an LLM decision: execute trade, skip, or schedule second look.
+async fn handle_llm_decision(
+    decision: &LlmDecision,
+    snapshot: &SignalSnapshot,
+    config: &Config,
+    risk: &mut RiskChecker,
+    position_monitor: &mut PositionMonitor,
+    second_look: &mut SecondLookScheduler,
+    tuner: &mut SignalTuner,
+    hl_executor: &Option<HlExecutor>,
+    journal: &TradeLogger,
+    tui_tx: &mpsc::Sender<TuiUpdate>,
+) {
+    match decision {
+        LlmDecision::Execute {
+            play_type,
+            direction,
+            size_pct,
+            hl_leverage,
+            stop_loss_pct,
+            take_profit_pct,
+            pm_hedge,
+            reasoning,
+        } => {
+            // Validate against hard risk limits
+            if let Err(reason) = risk.validate_decision(decision, config) {
+                warn!(reason = %reason, "LLM decision rejected by risk checker");
+                let _ = tui_tx.send(TuiUpdate::Log(format!(
+                    "[{}] Risk rejected: {}",
+                    chrono::Utc::now().format("%H:%M:%S"),
+                    reason,
+                ))).await;
+                return;
+            }
 
-enum TuiUpdate {
-    Price(f64),
-    Signal(SignalSnapshot),
-    Log(String),
+            let size_usd = risk.max_trade_usd(config) * (size_pct / config.capital.max_trade_pct);
+            let leverage = hl_leverage.unwrap_or(1);
+
+            info!(
+                play_type = %play_type, direction = %direction,
+                size_usd = size_usd, leverage = leverage,
+                "Executing trade"
+            );
+
+            // Place order via HL executor
+            let mut entry_price = 0.0;
+            if let Some(ref hl) = hl_executor {
+                let is_buy = *direction == Direction::Long;
+                let sz_coin = size_usd / snapshot.indicators.ema_9.unwrap_or(80000.0); // approximate
+                match hl.market_order("BTC", is_buy, sz_coin, leverage).await {
+                    Ok(result) => {
+                        if result.success {
+                            entry_price = result.filled_price.unwrap_or(0.0);
+                            info!(price = entry_price, "Order filled");
+
+                            // Place stop-loss and take-profit
+                            let sl_price = if is_buy {
+                                entry_price * (1.0 - stop_loss_pct / 100.0)
+                            } else {
+                                entry_price * (1.0 + stop_loss_pct / 100.0)
+                            };
+                            let tp_price = if is_buy {
+                                entry_price * (1.0 + take_profit_pct / 100.0)
+                            } else {
+                                entry_price * (1.0 - take_profit_pct / 100.0)
+                            };
+                            let _ = hl.stop_loss("BTC", sl_price, sz_coin, !is_buy).await;
+                            let _ = hl.take_profit("BTC", tp_price, sz_coin, !is_buy).await;
+                        } else {
+                            warn!(msg = %result.message, "Order failed");
+                            let _ = tui_tx.send(TuiUpdate::Log(format!(
+                                "[{}] Order failed: {}",
+                                chrono::Utc::now().format("%H:%M:%S"),
+                                result.message,
+                            ))).await;
+                            return;
+                        }
+                    }
+                    Err(e) => {
+                        error!("Order execution error: {e:#}");
+                        return;
+                    }
+                }
+            }
+
+            // Track position
+            let trade = ActiveTrade {
+                id: Uuid::new_v4(),
+                symbol: Symbol::BTC,
+                direction: *direction,
+                play_type: *play_type,
+                entry_price,
+                size_usd,
+                leverage: Some(leverage),
+                stop_loss_pct: *stop_loss_pct,
+                take_profit_pct: *take_profit_pct,
+                opened_at: chrono::Utc::now(),
+                max_hold_secs: config.execution.max_trade_duration_secs,
+                pm_hedge: pm_hedge.clone(),
+                llm_reasoning: reasoning.clone(),
+                signal_level: snapshot.level,
+                signal_score: snapshot.net_score,
+            };
+            position_monitor.add_trade(trade);
+            risk.set_open_positions(position_monitor.open_count());
+
+            let _ = tui_tx.send(TuiUpdate::Log(format!(
+                "[{}] EXECUTE {} {} ${:.0} @{:.0} lev={} — {}",
+                chrono::Utc::now().format("%H:%M:%S"),
+                play_type, direction, size_usd, entry_price, leverage,
+                reasoning,
+            ))).await;
+        }
+
+        LlmDecision::Skip { reasoning } => {
+            info!(reasoning = %reasoning, "LLM decided to SKIP");
+            let _ = tui_tx.send(TuiUpdate::Log(format!(
+                "[{}] SKIP — {}",
+                chrono::Utc::now().format("%H:%M:%S"),
+                reasoning,
+            ))).await;
+        }
+
+        LlmDecision::SecondLook {
+            recheck_after_secs,
+            what_to_watch,
+            reasoning,
+            ..
+        } => {
+            if second_look.schedule(decision) {
+                info!(
+                    recheck = recheck_after_secs,
+                    watch = %what_to_watch,
+                    "SecondLook scheduled"
+                );
+                let _ = tui_tx.send(TuiUpdate::Log(format!(
+                    "[{}] SECOND_LOOK in {}s — {}",
+                    chrono::Utc::now().format("%H:%M:%S"),
+                    recheck_after_secs, reasoning,
+                ))).await;
+            } else {
+                info!("Max SecondLooks reached, forcing SKIP");
+                let _ = tui_tx.send(TuiUpdate::Log(format!(
+                    "[{}] Max SecondLooks reached — forced SKIP",
+                    chrono::Utc::now().format("%H:%M:%S"),
+                ))).await;
+            }
+        }
+    }
 }

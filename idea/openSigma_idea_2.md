@@ -1,4 +1,4 @@
-# openSigma v2 — Short-Term Dual-Market Trading Agent
+# openSigma v1 — Short-Term Dual-Market Trading Agent
 
 **Status:** Design Phase  
 **Authors:** Daniel.T + Team  
@@ -533,7 +533,7 @@ openSigma/
 
 ## 13. Summary
 
-openSigma v2: one agent, two markets, pure Rust, ~10 days to first live trade.
+openSigma v1: one agent, two markets, pure Rust, ~10 days to first live trade.
 
 - **All signals through Claude Sonnet** — cost is negligible, value of second opinion is high
 - **SecondLook** — defers entry for better timing without wasting LLM calls

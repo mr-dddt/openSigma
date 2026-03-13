@@ -70,7 +70,7 @@ impl App {
             self.daily_pnl,
         );
         let status_block = Paragraph::new(status_text)
-            .block(Block::default().borders(Borders::ALL).title(" openSigma v2 "));
+            .block(Block::default().borders(Borders::ALL).title(" openSigma v1 "));
         frame.render_widget(status_block, top_chunks[0]);
 
         // Right: signal info

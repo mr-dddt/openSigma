@@ -1,7 +1,8 @@
-use chrono::Utc;
-use tracing::debug;
+use chrono::{DateTime, Utc};
+use tracing::{debug, info};
 
 use crate::config::Config;
+use crate::signals::candle_builder::CandleBuilder;
 use crate::signals::indicators::Indicators;
 use crate::types::*;
 
@@ -9,6 +10,7 @@ use crate::types::*;
 /// applies hard filters, and outputs a SignalSnapshot with level classification.
 pub struct SignalAggregator {
     pub indicators: Indicators,
+    candle_builder: CandleBuilder,
     // Latest state
     latest_price: f64,
     latest_funding: f64,
@@ -23,6 +25,7 @@ impl SignalAggregator {
     pub fn new() -> Self {
         Self {
             indicators: Indicators::new(),
+            candle_builder: CandleBuilder::new(),
             latest_price: 0.0,
             latest_funding: 0.0,
             latest_ob_imbalance: 1.0,
@@ -61,61 +64,77 @@ impl SignalAggregator {
         self.news_circuit_breaker = active;
     }
 
+    /// Push a trade tick for candle building. Completed candles are automatically
+    /// forwarded to the indicator calculator.
+    pub fn push_trade_for_candles(&mut self, price: f64, size: f64, ts: DateTime<Utc>) {
+        let (candle_1m, candle_5m) = self.candle_builder.push_tick(price, size, ts);
+        if let Some(c) = candle_1m {
+            info!(close = c.close, "1m candle closed");
+            self.indicators.push_candle_1m(c);
+        }
+        if let Some(c) = candle_5m {
+            info!(close = c.close, "5m candle closed");
+            self.indicators.push_candle_5m(c);
+        }
+    }
+
     /// Evaluate all indicators and produce a signal snapshot.
     pub fn evaluate(&self, config: &Config) -> SignalSnapshot {
         let mut bull = 0i32;
         let mut bear = 0i32;
         let mut indicators = IndicatorValues::default();
 
-        // --- EMA(9, 21) cross [weight 2] ---
+        let sig = &config.signals;
+
+        // --- EMA(9, 21) cross [configurable weight] ---
         let ema_9 = self.indicators.ema_9();
         let ema_21 = self.indicators.ema_21();
         indicators.ema_9 = ema_9;
         indicators.ema_21 = ema_21;
         if let (Some(e9), Some(e21)) = (ema_9, ema_21) {
             if e9 > e21 {
-                bull += 2; // bullish cross
+                bull += sig.ema_cross_weight;
             } else if e9 < e21 {
-                bear += 2; // bearish cross
+                bear += sig.ema_cross_weight;
             }
         }
 
-        // --- RSI(14) 5m [weight 1] ---
+        // --- RSI(14) 5m [configurable weight + thresholds] ---
         let rsi = self.indicators.rsi_14();
         indicators.rsi_14 = rsi;
         if let Some(r) = rsi {
-            if r < 35.0 {
-                bull += 1; // oversold bounce
-            } else if r > 65.0 {
-                bear += 1; // overbought fade
+            if r < sig.rsi_oversold {
+                bull += sig.rsi_weight;
+            } else if r > sig.rsi_overbought {
+                bear += sig.rsi_weight;
             }
         }
 
-        // --- CVD 5m [weight 2] ---
+        // --- CVD 5m [configurable weight] ---
         let cvd = self.indicators.cvd();
         indicators.cvd = Some(cvd);
         if cvd > 0.0 {
-            bull += 2; // net buying pressure
+            bull += sig.cvd_weight;
         } else if cvd < 0.0 {
-            bear += 2; // net selling pressure
+            bear += sig.cvd_weight;
         }
 
-        // --- Order Book Imbalance [weight 1] ---
+        // --- Order Book Imbalance [configurable weight] ---
         indicators.ob_imbalance = Some(self.latest_ob_imbalance);
         if self.latest_ob_imbalance > 2.0 {
-            bull += 1; // buy orders > 2x sell
+            bull += sig.ob_weight;
         } else if self.latest_ob_imbalance < 0.5 {
-            bear += 1; // sell orders > 2x buy
+            bear += sig.ob_weight;
         }
 
-        // --- Stochastic RSI 1m [weight 1] ---
+        // --- Stochastic RSI 1m [configurable weight] ---
         let stoch = self.indicators.stoch_rsi();
         indicators.stoch_rsi = stoch;
         if let Some(s) = stoch {
             if s < 20.0 {
-                bull += 1; // oversold
+                bull += sig.stoch_rsi_weight;
             } else if s > 80.0 {
-                bear += 1; // overbought
+                bear += sig.stoch_rsi_weight;
             }
         }
 

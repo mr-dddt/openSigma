@@ -61,14 +61,21 @@ impl HyperliquidFeed {
         });
         write.send(Message::Text(sub_book.to_string())).await?;
 
-        info!("Subscribed to HL channels: allMids, trades(BTC), l2Book(BTC)");
+        // Subscribe to activeAssetCtx for BTC (funding rate)
+        let sub_ctx = serde_json::json!({
+            "method": "subscribe",
+            "subscription": { "type": "activeAssetCtx", "coin": "BTC" }
+        });
+        write.send(Message::Text(sub_ctx.to_string())).await?;
+
+        info!("Subscribed to HL channels: allMids, trades(BTC), l2Book(BTC), activeAssetCtx(BTC)");
 
         while let Some(msg) = read.next().await {
             match msg {
                 Ok(Message::Text(text)) => {
-                    if let Err(e) = self.handle_message(&text).await {
-                        warn!("Failed to parse HL message: {e:#}");
-                    }
+                    // Silently ignore parse errors — HL sends subscription confirmations,
+                    // heartbeats, and other messages that don't match our known types.
+                    let _ = self.handle_message(&text).await;
                 }
                 Ok(Message::Ping(data)) => {
                     let _ = write.send(Message::Pong(data)).await;
@@ -98,7 +105,10 @@ impl HyperliquidFeed {
             HlWsMessage::L2Book(envelope) => {
                 self.handle_l2_book(&envelope.data).await;
             }
-            HlWsMessage::Other => {}
+            HlWsMessage::ActiveAssetCtx(envelope) => {
+                self.handle_asset_ctx(&envelope.data).await;
+            }
+            HlWsMessage::Other(_) => {}
         }
 
         Ok(())
@@ -151,6 +161,27 @@ impl HyperliquidFeed {
         }
     }
 
+    async fn handle_asset_ctx(&self, ctx: &ActiveAssetCtxData) {
+        let symbol = match ctx.coin.as_str() {
+            "BTC" => Symbol::BTC,
+            "ETH" => Symbol::ETH,
+            _ => return,
+        };
+        if let Some(ref funding) = ctx.ctx.funding {
+            if let Ok(rate) = funding.parse::<f64>() {
+                info!(symbol = %symbol, rate = rate, "Funding rate update");
+                let _ = self
+                    .event_tx
+                    .send(MarketEvent::Funding(FundingTick {
+                        symbol,
+                        rate,
+                        timestamp: Utc::now(),
+                    }))
+                    .await;
+            }
+        }
+    }
+
     async fn handle_l2_book(&self, book: &L2BookData) {
         let symbol = match book.coin.as_str() {
             "BTC" => Symbol::BTC,
@@ -198,7 +229,8 @@ enum HlWsMessage {
     AllMids(AllMidsEnvelope),
     Trades(TradesEnvelope),
     L2Book(L2BookEnvelope),
-    Other,
+    ActiveAssetCtx(ActiveAssetCtxEnvelope),
+    Other(serde_json::Value),
 }
 
 // We need to handle the nested envelope: {"channel": "allMids", "data": {...}}
@@ -279,4 +311,30 @@ struct L2BookData {
 struct L2Level {
     px: String,
     sz: String,
+}
+
+// activeAssetCtx envelope: {"channel": "activeAssetCtx", "data": {"coin": "BTC", "ctx": {"funding": "0.00012", ...}}}
+
+#[derive(Debug, Deserialize)]
+struct ActiveAssetCtxEnvelope {
+    #[serde(rename = "channel")]
+    _channel: ActiveAssetCtxChannel,
+    data: ActiveAssetCtxData,
+}
+
+#[derive(Debug, Deserialize)]
+enum ActiveAssetCtxChannel {
+    #[serde(rename = "activeAssetCtx")]
+    ActiveAssetCtx,
+}
+
+#[derive(Debug, Deserialize)]
+struct ActiveAssetCtxData {
+    coin: String,
+    ctx: AssetCtx,
+}
+
+#[derive(Debug, Deserialize)]
+struct AssetCtx {
+    funding: Option<String>,
 }

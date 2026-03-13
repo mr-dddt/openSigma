@@ -43,3 +43,15 @@ strong_threshold = 5
 lean_threshold = 3
 min_atr_pct = 0.05
 max_funding_same_dir = 0.03
+# Tunable indicator weights (LLM can adjust at runtime)
+ema_cross_weight = 2
+cvd_weight = 2
+rsi_weight = 1
+ob_weight = 1
+stoch_rsi_weight = 1
+rsi_oversold = 35.0
+rsi_overbought = 65.0
+
+[tuning]
+tune_every_n_trades = 20
+inactivity_timeout_secs = 600

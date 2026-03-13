@@ -1,5 +1,6 @@
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
+use uuid::Uuid;
 
 // ---------------------------------------------------------------------------
 // Symbols & directions
@@ -156,7 +157,7 @@ impl std::fmt::Display for SignalLevel {
     }
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize)]
 pub struct SignalSnapshot {
     pub bull_score: i32,
     pub bear_score: i32,
@@ -167,7 +168,7 @@ pub struct SignalSnapshot {
     pub timestamp: DateTime<Utc>,
 }
 
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone, Default, Serialize)]
 pub struct IndicatorValues {
     pub ema_9: Option<f64>,
     pub ema_21: Option<f64>,
@@ -184,7 +185,7 @@ pub struct IndicatorValues {
 }
 
 // ---------------------------------------------------------------------------
-// Play types & LLM decisions (Phase 2 types, defined for completeness)
+// Play types & LLM decisions
 // ---------------------------------------------------------------------------
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -194,6 +195,18 @@ pub enum PlayType {
     HedgedPerp,
     BinaryArbitrage,
     CrossMarketMomentum,
+}
+
+impl std::fmt::Display for PlayType {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            PlayType::PurePerpScalp => write!(f, "PurePerpScalp"),
+            PlayType::PureBinaryBet => write!(f, "PureBinaryBet"),
+            PlayType::HedgedPerp => write!(f, "HedgedPerp"),
+            PlayType::BinaryArbitrage => write!(f, "BinaryArbitrage"),
+            PlayType::CrossMarketMomentum => write!(f, "CrossMarketMomentum"),
+        }
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -230,6 +243,70 @@ pub struct PmHedge {
 pub enum BinarySide {
     Up,
     Down,
+}
+
+// ---------------------------------------------------------------------------
+// Tuning types (signal engine auto-optimization)
+// ---------------------------------------------------------------------------
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct TuneDecision {
+    pub adjustments: Vec<TuneAdjustment>,
+    pub reasoning: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct TuneAdjustment {
+    pub param: String,
+    pub old_value: f64,
+    pub new_value: f64,
+}
+
+// ---------------------------------------------------------------------------
+// Trade record (for journal)
+// ---------------------------------------------------------------------------
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct TradeRecord {
+    pub id: Uuid,
+    pub ts_open: DateTime<Utc>,
+    pub ts_close: Option<DateTime<Utc>>,
+    pub duration_secs: Option<u64>,
+    pub play_type: PlayType,
+    pub direction: Direction,
+    pub signal_level: SignalLevel,
+    pub signal_score: i32,
+    pub entry_price: f64,
+    pub exit_price: Option<f64>,
+    pub size_usd: f64,
+    pub leverage: Option<u8>,
+    pub pnl_usd: Option<f64>,
+    pub exit_reason: Option<String>,
+    pub llm_reasoning: String,
+    pub capital_after: Option<f64>,
+}
+
+// ---------------------------------------------------------------------------
+// Execution types
+// ---------------------------------------------------------------------------
+
+#[derive(Debug, Clone)]
+pub struct ActiveTrade {
+    pub id: Uuid,
+    pub symbol: Symbol,
+    pub direction: Direction,
+    pub play_type: PlayType,
+    pub entry_price: f64,
+    pub size_usd: f64,
+    pub leverage: Option<u8>,
+    pub stop_loss_pct: f64,
+    pub take_profit_pct: f64,
+    pub opened_at: DateTime<Utc>,
+    pub max_hold_secs: u64,
+    pub pm_hedge: Option<PmHedge>,
+    pub llm_reasoning: String,
+    pub signal_level: SignalLevel,
+    pub signal_score: i32,
 }
 
 // ---------------------------------------------------------------------------

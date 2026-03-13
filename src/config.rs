@@ -1,5 +1,5 @@
 use anyhow::{Context, Result};
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 
 /// Secrets loaded from .env
@@ -32,6 +32,8 @@ pub struct Config {
     pub sessions: HashMap<String, SessionConfig>,
     pub llm: LlmConfig,
     pub signals: SignalConfig,
+    #[serde(default)]
+    pub tuning: TuningConfig,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -76,12 +78,53 @@ pub struct LlmConfig {
     pub timeout_ms: u64,
 }
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct SignalConfig {
     pub strong_threshold: i32,
     pub lean_threshold: i32,
     pub min_atr_pct: f64,
     pub max_funding_same_dir: f64,
+    // Tunable indicator weights (LLM can adjust at runtime)
+    #[serde(default = "default_2")]
+    pub ema_cross_weight: i32,
+    #[serde(default = "default_2")]
+    pub cvd_weight: i32,
+    #[serde(default = "default_1")]
+    pub rsi_weight: i32,
+    #[serde(default = "default_1")]
+    pub ob_weight: i32,
+    #[serde(default = "default_1")]
+    pub stoch_rsi_weight: i32,
+    // Tunable RSI thresholds
+    #[serde(default = "default_rsi_oversold")]
+    pub rsi_oversold: f64,
+    #[serde(default = "default_rsi_overbought")]
+    pub rsi_overbought: f64,
+}
+
+fn default_2() -> i32 { 2 }
+fn default_1() -> i32 { 1 }
+fn default_rsi_oversold() -> f64 { 35.0 }
+fn default_rsi_overbought() -> f64 { 65.0 }
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct TuningConfig {
+    #[serde(default = "default_tune_trades")]
+    pub tune_every_n_trades: u64,
+    #[serde(default = "default_inactivity")]
+    pub inactivity_timeout_secs: u64,
+}
+
+fn default_tune_trades() -> u64 { 20 }
+fn default_inactivity() -> u64 { 600 }
+
+impl Default for TuningConfig {
+    fn default() -> Self {
+        Self {
+            tune_every_n_trades: 20,
+            inactivity_timeout_secs: 600,
+        }
+    }
 }
 
 impl Config {
