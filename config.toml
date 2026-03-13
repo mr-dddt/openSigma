@@ -1,12 +1,12 @@
 [capital]
 initial_usd = 50.0
-max_trade_pct = 3.0
-max_concurrent_positions = 2
-max_daily_loss_pct = 5.0
-kill_switch_drawdown_pct = 10.0
+max_trade_pct = 10.0
+max_concurrent_positions = 4
+max_daily_loss_pct = 10.0
+kill_switch_drawdown_pct = 20.0
 
 [hyperliquid]
-max_leverage = 10
+max_leverage = 15
 
 [polymarket]
 max_bet_usd = 50.0

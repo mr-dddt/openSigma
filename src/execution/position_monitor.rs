@@ -81,6 +81,22 @@ impl PositionMonitor {
         &self.active_trades
     }
 
+    /// Find all positions in the opposite direction. Used to close
+    /// counter-trend positions before opening new ones.
+    pub fn opposite_direction_ids(&self, direction: crate::types::Direction) -> Vec<Uuid> {
+        self.active_trades
+            .iter()
+            .filter(|t| t.direction != direction)
+            .map(|t| t.id)
+            .collect()
+    }
+
+    /// Check if any positions exist in the opposite direction.
+    #[allow(dead_code)]
+    pub fn has_opposite(&self, direction: crate::types::Direction) -> bool {
+        self.active_trades.iter().any(|t| t.direction != direction)
+    }
+
     /// Calculate total unrealized PnL.
     #[allow(dead_code)]
     pub fn unrealized_pnl(&self, current_price: f64) -> f64 {

@@ -362,8 +362,8 @@ async fn main() -> Result<()> {
                 Some(event) = market_rx.recv() => {
                     match &event {
                         MarketEvent::Price(tick) => {
-                            aggregator.update_price(tick.price);
                             if tick.symbol == Symbol::BTC {
+                                aggregator.update_price(tick.price);
                                 let _ = tui_tx_clone.send(TuiUpdate::Price(tick.price)).await;
 
                                 // Check position price levels
@@ -575,11 +575,14 @@ async fn main() -> Result<()> {
                         tuner.record_signal_pass();
 
                         if let Err(reason) = risk.can_trade(&cfg) {
-                            let _ = tui_tx_clone.send(TuiUpdate::Log(format!(
-                                "[{}] Risk block: {}",
-                                chrono::Utc::now().format("%H:%M:%S"),
-                                reason,
-                            ))).await;
+                            // Only log non-cooldown risk blocks (cooldown spams every 5s)
+                            if !reason.starts_with("Cooldown") {
+                                let _ = tui_tx_clone.send(TuiUpdate::Log(format!(
+                                    "[{}] Risk block: {}",
+                                    chrono::Utc::now().format("%H:%M:%S"),
+                                    reason,
+                                ))).await;
+                            }
                         } else {
                             let _ = tui_tx_clone.send(TuiUpdate::Log(format!(
                                 "[{}] {} (net={}) → LLM gate...",
@@ -784,6 +787,59 @@ async fn handle_llm_decision(
                 return;
             }
 
+            // Close opposite-direction positions before opening new ones.
+            // If we're going Long but have Shorts open, close the Shorts first.
+            let opposite_ids = position_monitor.opposite_direction_ids(*direction);
+            if !opposite_ids.is_empty() {
+                let _ = tui_tx.send(TuiUpdate::Log(format!(
+                    "[{}] Closing {} opposite-direction position(s) before reversing",
+                    chrono::Utc::now().format("%H:%M:%S"),
+                    opposite_ids.len(),
+                ))).await;
+
+                for opp_id in &opposite_ids {
+                    if let Some(opp_trade) = position_monitor.remove_trade(opp_id) {
+                        if let Some(ref hl) = hl_executor {
+                            let is_buy = opp_trade.direction == Direction::Short;
+                            let sz = opp_trade.size_usd / opp_trade.entry_price;
+                            let _ = hl.market_order("BTC", is_buy, sz, opp_trade.leverage.unwrap_or(1)).await;
+                        }
+                        let current_price = snapshot.indicators.ema_9.unwrap_or(0.0);
+                        let lev = opp_trade.leverage.unwrap_or(1) as f64;
+                        let pnl = match opp_trade.direction {
+                            Direction::Long => (current_price - opp_trade.entry_price) / opp_trade.entry_price * opp_trade.size_usd * lev,
+                            Direction::Short => (opp_trade.entry_price - current_price) / opp_trade.entry_price * opp_trade.size_usd * lev,
+                        };
+                        risk.record_trade_pnl(pnl);
+                        let record = TradeRecord {
+                            id: opp_trade.id,
+                            ts_open: opp_trade.opened_at,
+                            ts_close: Some(chrono::Utc::now()),
+                            duration_secs: Some((chrono::Utc::now() - opp_trade.opened_at).num_seconds() as u64),
+                            play_type: opp_trade.play_type,
+                            direction: opp_trade.direction,
+                            signal_level: opp_trade.signal_level,
+                            signal_score: opp_trade.signal_score,
+                            entry_price: opp_trade.entry_price,
+                            exit_price: Some(current_price),
+                            size_usd: opp_trade.size_usd,
+                            leverage: opp_trade.leverage,
+                            pnl_usd: Some(pnl),
+                            exit_reason: Some("reversed".to_string()),
+                            llm_reasoning: opp_trade.llm_reasoning.clone(),
+                            capital_after: Some(risk.current_equity()),
+                        };
+                        let _ = journal.log_entry(&record);
+                        let _ = tui_tx.send(TuiUpdate::Log(format!(
+                            "[{}] {} closed (reversed) PnL: ${:.2}",
+                            chrono::Utc::now().format("%H:%M:%S"),
+                            opp_trade.direction, pnl,
+                        ))).await;
+                    }
+                }
+                risk.set_open_positions(position_monitor.open_count(), config);
+            }
+
             let size_usd = risk.max_trade_usd(config) * (size_pct / config.capital.max_trade_pct);
             let leverage = hl_leverage.unwrap_or(1);
 
@@ -837,8 +893,8 @@ async fn handle_llm_decision(
                 }
             }
 
-            // Track position (size_usd = notional, consistent with recovered positions)
-            let notional_usd = size_usd * leverage as f64;
+            // Track position (size_usd = notional, must match the actual HL order)
+            let notional_usd = (size_usd * leverage as f64).max(10.5);
             let trade = ActiveTrade {
                 id: Uuid::new_v4(),
                 symbol: Symbol::BTC,

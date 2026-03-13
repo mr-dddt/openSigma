@@ -109,8 +109,8 @@ impl App {
             .direction(ratatui::layout::Direction::Vertical)
             .constraints([
                 Constraint::Length(7),  // top: status + signal
-                Constraint::Length(5),  // positions
-                Constraint::Min(8),    // log
+                Constraint::Length(8),  // positions (expanded)
+                Constraint::Min(6),    // log
                 Constraint::Length(3), // footer: stats + keys
             ])
             .split(frame.area());
