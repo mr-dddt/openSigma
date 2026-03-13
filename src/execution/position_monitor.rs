@@ -54,6 +54,7 @@ impl PositionMonitor {
         let mut events = Vec::new();
 
         for trade in &self.active_trades {
+
             let pnl_pct = match trade.direction {
                 crate::types::Direction::Long => {
                     (current_price - trade.entry_price) / trade.entry_price * 100.0
@@ -77,6 +78,7 @@ impl PositionMonitor {
         self.active_trades.len() as u32
     }
 
+    #[allow(dead_code)]
     pub fn active_trades(&self) -> &[ActiveTrade] {
         &self.active_trades
     }

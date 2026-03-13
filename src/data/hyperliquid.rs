@@ -10,6 +10,18 @@ use crate::types::*;
 
 const HL_WS_URL: &str = "wss://api.hyperliquid.xyz/ws";
 
+/// Map HL coin string to our Symbol enum.
+fn coin_to_symbol(coin: &str) -> Option<Symbol> {
+    match coin {
+        "BTC" => Some(Symbol::BTC),
+        "ETH" => Some(Symbol::ETH),
+        "SOL" => Some(Symbol::SOL),
+        "HYPE" => Some(Symbol::HYPE),
+        "CL/USDC" => Some(Symbol::ClUsdc),
+        _ => None,
+    }
+}
+
 /// Hyperliquid WebSocket data feed.
 /// Streams real-time price (allMids), trades, l2Book, and funding for BTC.
 pub struct HyperliquidFeed {
@@ -47,28 +59,31 @@ impl HyperliquidFeed {
         });
         write.send(Message::Text(sub_all_mids.to_string())).await?;
 
-        // Subscribe to trades for BTC
-        let sub_trades = serde_json::json!({
-            "method": "subscribe",
-            "subscription": { "type": "trades", "coin": "BTC" }
-        });
-        write.send(Message::Text(sub_trades.to_string())).await?;
+        // Subscribe to trades, l2Book, and activeAssetCtx for each tradeable symbol
+        for symbol in Symbol::all() {
+            let coin = symbol.hl_coin();
 
-        // Subscribe to l2Book for BTC (order book)
-        let sub_book = serde_json::json!({
-            "method": "subscribe",
-            "subscription": { "type": "l2Book", "coin": "BTC" }
-        });
-        write.send(Message::Text(sub_book.to_string())).await?;
+            let sub_trades = serde_json::json!({
+                "method": "subscribe",
+                "subscription": { "type": "trades", "coin": coin }
+            });
+            write.send(Message::Text(sub_trades.to_string())).await?;
 
-        // Subscribe to activeAssetCtx for BTC (funding rate)
-        let sub_ctx = serde_json::json!({
-            "method": "subscribe",
-            "subscription": { "type": "activeAssetCtx", "coin": "BTC" }
-        });
-        write.send(Message::Text(sub_ctx.to_string())).await?;
+            let sub_book = serde_json::json!({
+                "method": "subscribe",
+                "subscription": { "type": "l2Book", "coin": coin }
+            });
+            write.send(Message::Text(sub_book.to_string())).await?;
 
-        info!("Subscribed to HL channels: allMids, trades(BTC), l2Book(BTC), activeAssetCtx(BTC)");
+            let sub_ctx = serde_json::json!({
+                "method": "subscribe",
+                "subscription": { "type": "activeAssetCtx", "coin": coin }
+            });
+            write.send(Message::Text(sub_ctx.to_string())).await?;
+        }
+
+        let coins: Vec<&str> = Symbol::all().iter().map(|s| s.hl_coin()).collect();
+        info!(coins = ?coins, "Subscribed to HL channels: allMids + trades/l2Book/activeAssetCtx per coin");
 
         while let Some(msg) = read.next().await {
             match msg {
@@ -116,14 +131,14 @@ impl HyperliquidFeed {
 
     async fn handle_all_mids(&self, mids: &AllMidsData) {
         // allMids returns a map of coin -> mid price string
-        for symbol in [Symbol::BTC, Symbol::ETH] {
-            let coin = symbol.to_string();
+        for symbol in Symbol::all() {
+            let coin = symbol.hl_coin().to_string();
             if let Some(price_str) = mids.mids.get(&coin) {
                 if let Ok(price) = price_str.parse::<f64>() {
                     let _ = self
                         .event_tx
                         .send(MarketEvent::Price(PriceTick {
-                            symbol,
+                            symbol: *symbol,
                             price,
                             timestamp: Utc::now(),
                         }))
@@ -135,10 +150,9 @@ impl HyperliquidFeed {
 
     async fn handle_trades(&self, trades: &TradesData) {
         for t in &trades.trades {
-            let symbol = match t.coin.as_str() {
-                "BTC" => Symbol::BTC,
-                "ETH" => Symbol::ETH,
-                _ => continue,
+            let symbol = match coin_to_symbol(&t.coin) {
+                Some(s) => s,
+                None => continue,
             };
             let side = if t.side == "B" {
                 Direction::Long
@@ -162,10 +176,9 @@ impl HyperliquidFeed {
     }
 
     async fn handle_asset_ctx(&self, ctx: &ActiveAssetCtxData) {
-        let symbol = match ctx.coin.as_str() {
-            "BTC" => Symbol::BTC,
-            "ETH" => Symbol::ETH,
-            _ => return,
+        let symbol = match coin_to_symbol(&ctx.coin) {
+            Some(s) => s,
+            None => return,
         };
         if let Some(ref funding) = ctx.ctx.funding {
             if let Ok(rate) = funding.parse::<f64>() {
@@ -183,10 +196,9 @@ impl HyperliquidFeed {
     }
 
     async fn handle_l2_book(&self, book: &L2BookData) {
-        let symbol = match book.coin.as_str() {
-            "BTC" => Symbol::BTC,
-            "ETH" => Symbol::ETH,
-            _ => return,
+        let symbol = match coin_to_symbol(&book.coin) {
+            Some(s) => s,
+            None => return,
         };
 
         let parse_levels = |levels: &[L2Level]| -> Vec<(f64, f64)> {

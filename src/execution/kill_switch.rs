@@ -2,7 +2,6 @@ use anyhow::Result;
 use tracing::error;
 
 use crate::execution::hyperliquid::HlExecutor;
-use crate::execution::polymarket::PmExecutor;
 
 /// Kill switch: emergency close all positions.
 pub struct KillSwitch {
@@ -14,21 +13,17 @@ impl KillSwitch {
         Self { triggered: false }
     }
 
-    /// Trigger kill switch and close all positions on both exchanges.
+    /// Trigger kill switch and close all positions.
     #[allow(dead_code)]
-    pub async fn trigger_with_executors(
+    pub async fn trigger_with_executor(
         &mut self,
         hl: &HlExecutor,
-        pm: &PmExecutor,
     ) -> Result<()> {
         error!("KILL SWITCH ACTIVATED — closing all positions");
         self.triggered = true;
 
         if let Err(e) = hl.close_all().await {
             error!("Failed to close HL positions: {e:#}");
-        }
-        if let Err(e) = pm.cancel_all().await {
-            error!("Failed to cancel PM orders: {e:#}");
         }
 
         Ok(())

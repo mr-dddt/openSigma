@@ -15,7 +15,6 @@ pub struct SignalAggregator {
     latest_price: f64,
     latest_funding: f64,
     latest_ob_imbalance: f64,
-    latest_pm_up: Option<f64>,
     daily_pnl_pct: f64,
     kill_switch_triggered: bool,
     news_circuit_breaker: bool,
@@ -29,7 +28,6 @@ impl SignalAggregator {
             latest_price: 0.0,
             latest_funding: 0.0,
             latest_ob_imbalance: 1.0,
-            latest_pm_up: None,
             daily_pnl_pct: 0.0,
             kill_switch_triggered: false,
             news_circuit_breaker: false,
@@ -40,6 +38,7 @@ impl SignalAggregator {
         self.latest_price = price;
     }
 
+    #[allow(dead_code)]
     pub fn latest_price(&self) -> f64 {
         self.latest_price
     }
@@ -50,10 +49,6 @@ impl SignalAggregator {
 
     pub fn update_ob_imbalance(&mut self, imbalance: f64) {
         self.latest_ob_imbalance = imbalance;
-    }
-
-    pub fn update_pm_odds(&mut self, up_price: f64) {
-        self.latest_pm_up = Some(up_price);
     }
 
     pub fn update_daily_pnl(&mut self, pnl_pct: f64) {
@@ -140,22 +135,6 @@ impl SignalAggregator {
                 bull += sig.stoch_rsi_weight;
             } else if s > 80.0 {
                 bear += sig.stoch_rsi_weight;
-            }
-        }
-
-        // --- PM Odds Divergence [weight 1] ---
-        if let Some(pm_up) = self.latest_pm_up {
-            // If technicals are bullish but PM "Down" is cheap → extra bull
-            // If technicals are bearish but PM "Up" is cheap → extra bear
-            let net_so_far = bull - bear;
-            if net_so_far > 0 && pm_up < 0.4 {
-                // PM thinks bearish, but technicals disagree → divergence bull signal
-                bull += 1;
-                indicators.pm_divergence = Some(pm_up);
-            } else if net_so_far < 0 && pm_up > 0.6 {
-                // PM thinks bullish, but technicals disagree → divergence bear signal
-                bear += 1;
-                indicators.pm_divergence = Some(pm_up);
             }
         }
 

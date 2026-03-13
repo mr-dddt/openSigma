@@ -6,9 +6,6 @@ use std::collections::HashMap;
 #[derive(Debug, Clone)]
 pub struct Secrets {
     pub hl_private_key: String,
-    pub pm_api_key: String,
-    pub pm_api_secret: String,
-    pub pm_passphrase: String,
     pub anthropic_api_key: String,
     pub telegram_bot_token: String,
     pub telegram_chat_id: String,
@@ -20,9 +17,6 @@ impl Secrets {
         Ok(Self {
             hl_private_key: std::env::var("HL_PRIVATE_KEY")
                 .context("HL_PRIVATE_KEY must be set in .env")?,
-            pm_api_key: std::env::var("POLY_API_KEY").unwrap_or_default(),
-            pm_api_secret: std::env::var("POLY_API_SECRET").unwrap_or_default(),
-            pm_passphrase: std::env::var("POLY_PASSPHRASE").unwrap_or_default(),
             anthropic_api_key: std::env::var("ANTHROPIC_API_KEY")
                 .context("ANTHROPIC_API_KEY must be set in .env")?,
             telegram_bot_token: std::env::var("TELEGRAM_BOT_TOKEN").unwrap_or_default(),
@@ -32,12 +26,10 @@ impl Secrets {
 }
 
 /// Full config loaded from config.toml
-#[allow(dead_code)] // polymarket config read from TOML but not yet wired
 #[derive(Debug, Clone, Deserialize)]
 pub struct Config {
     pub capital: CapitalConfig,
     pub hyperliquid: HlConfig,
-    pub polymarket: PmConfig,
     pub execution: ExecutionConfig,
     pub sessions: HashMap<String, SessionConfig>,
     pub llm: LlmConfig,
@@ -60,15 +52,6 @@ pub struct CapitalConfig {
 #[derive(Debug, Clone, Deserialize)]
 pub struct HlConfig {
     pub max_leverage: u8,
-}
-
-#[allow(dead_code)] // PM config loaded from TOML, will be used when PM is wired
-#[derive(Debug, Clone, Deserialize)]
-pub struct PmConfig {
-    pub max_bet_usd: f64,
-    pub max_hedge_ratio: f64,
-    pub prefer_maker_orders: bool,
-    pub min_window_remaining_secs: u64,
 }
 
 #[derive(Debug, Clone, Deserialize)]

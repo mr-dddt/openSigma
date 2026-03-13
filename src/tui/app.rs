@@ -2,25 +2,21 @@ use ratatui::{
     prelude::{Color, Constraint, Frame, Layout, Line, Rect, Span, Style, Stylize},
     widgets::{Block, Borders, List, ListItem, Paragraph},
 };
-use uuid::Uuid;
 
 use crate::types::{
-    AgentStatus, Direction, PlayType, SignalLevel, SignalSnapshot,
+    AgentStatus, Direction, SignalLevel, SignalSnapshot,
 };
 
-// TUI-specific display types
+// TUI-specific display types — sourced from HL queries, not internal calculations
 
-#[allow(dead_code)]
 #[derive(Debug, Clone)]
 pub struct PositionInfo {
-    pub id: Uuid,
+    pub coin: String,
     pub direction: Direction,
-    pub play_type: PlayType,
     pub entry_price: f64,
-    pub size_usd: f64,
+    pub notional: f64,     // |size| * entry_price
     pub leverage: u8,
-    pub unrealized_pnl: f64,
-    pub duration_secs: u64,
+    pub unrealized_pnl: f64, // from HL directly
 }
 
 #[derive(Debug, Clone, Default)]
@@ -34,7 +30,7 @@ pub struct PerformanceStats {
 #[derive(Debug, Clone, Default)]
 pub struct ExchangeBalances {
     pub hl_equity: f64,
-    pub pm_balance: f64,
+    pub hl_available: f64,
 }
 
 pub struct App {
@@ -100,7 +96,7 @@ impl App {
 
     pub fn update_balances(&mut self, balances: ExchangeBalances) {
         self.balances = balances;
-        self.equity = self.balances.hl_equity + self.balances.pm_balance;
+        self.equity = self.balances.hl_equity;
         if self.initial_equity > 0.0 {
             self.daily_pnl = ((self.equity - self.initial_equity) / self.initial_equity) * 100.0;
         }
@@ -136,15 +132,15 @@ impl App {
 
         let status_lines = vec![
             Line::from(vec![
-                Span::styled(" BTC:  ", Style::default().fg(Color::Cyan)),
-                Span::styled(format!("${:.2}", self.btc_price), Style::default().fg(Color::White).bold()),
+                Span::styled(" BTC:", Style::default().fg(Color::Cyan)),
+                Span::styled(format!("${:.0}", self.btc_price), Style::default().fg(Color::White).bold()),
                 Span::styled(format!("  [{}]", self.status), Style::default().fg(status_color(self.status))),
             ]),
             Line::from(vec![
                 Span::styled(" HL:   ", Style::default().fg(Color::Cyan)),
                 Span::styled(format!("${:.2}", self.balances.hl_equity), Style::default().fg(Color::White)),
-                Span::styled("  PM: ", Style::default().fg(Color::Cyan)),
-                Span::styled(format!("${:.2}", self.balances.pm_balance), Style::default().fg(Color::White)),
+                Span::styled("  Free: ", Style::default().fg(Color::Cyan)),
+                Span::styled(format!("${:.2}", self.balances.hl_available), Style::default().fg(Color::White)),
             ]),
             Line::from(vec![
                 Span::styled(" Total:", Style::default().fg(Color::Cyan)),
@@ -218,18 +214,15 @@ impl App {
             self.positions.iter().map(|p| {
                 let pnl_color = if p.unrealized_pnl >= 0.0 { Color::Green } else { Color::Red };
                 let dir_color = if p.direction == Direction::Long { Color::Green } else { Color::Red };
-                let mins = p.duration_secs / 60;
-                let secs = p.duration_secs % 60;
 
                 ListItem::new(Line::from(vec![
                     Span::styled(format!(" {} ", p.direction), Style::default().fg(dir_color).bold()),
-                    Span::raw(format!("{} ${:.0} @{:.0} lev={}  ", p.play_type, p.size_usd, p.entry_price, p.leverage)),
+                    Span::raw(format!("{} ${:.0} @{:.0} lev={}  ", p.coin, p.notional, p.entry_price, p.leverage)),
                     Span::styled("PnL: ", Style::default().fg(Color::Cyan)),
                     Span::styled(
                         format!("${:+.2}", p.unrealized_pnl),
                         Style::default().fg(pnl_color).bold(),
                     ),
-                    Span::styled(format!(" ({m}m{s:02}s)", m = mins, s = secs), Style::default().fg(Color::DarkGray)),
                 ]))
             }).collect()
         };

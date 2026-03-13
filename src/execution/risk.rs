@@ -1,4 +1,4 @@
-use chrono::{DateTime, Utc};
+use chrono::{DateTime, Datelike, Utc};
 
 use crate::config::Config;
 use crate::types::LlmDecision;
@@ -19,6 +19,7 @@ pub struct RiskChecker {
     streak: i32,
     at_max_positions: bool,
     last_trade_at: Option<DateTime<Utc>>,
+    last_reset_day: u32, // day-of-year of last daily reset
 }
 
 impl RiskChecker {
@@ -34,6 +35,7 @@ impl RiskChecker {
             streak: 0,
             at_max_positions: false,
             last_trade_at: None,
+            last_reset_day: Utc::now().ordinal(),
         }
     }
 
@@ -51,6 +53,17 @@ impl RiskChecker {
             if self.start_of_day_equity <= 0.0 {
                 self.start_of_day_equity = exchange_equity;
             }
+        }
+    }
+
+    /// Reset daily counters if a new UTC day has started.
+    pub fn maybe_reset_day(&mut self) {
+        let today = Utc::now().ordinal();
+        if today != self.last_reset_day {
+            self.daily_loss_usd = 0.0;
+            self.start_of_day_equity = self.current_equity;
+            self.last_reset_day = today;
+            tracing::info!(equity = self.current_equity, "Daily risk counters reset (new UTC day)");
         }
     }
 
@@ -212,4 +225,9 @@ impl RiskChecker {
     pub fn total_closed(&self) -> u64 {
         self.total_closed
     }
+
+    pub fn daily_loss_usd(&self) -> f64 {
+        self.daily_loss_usd
+    }
+
 }

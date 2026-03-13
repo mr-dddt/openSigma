@@ -8,6 +8,57 @@ use hyperliquid_rust_sdk::{
     InfoClient, MarketOrderParams,
 };
 
+/// Lightweight account state query — no signing needed, just reads.
+/// Used by the balance poller task which doesn't need order execution.
+pub async fn query_account_state(wallet_address: ethers::types::Address) -> Result<(f64, f64, Vec<HlPosition>)> {
+    let info = InfoClient::new(None, Some(BaseUrl::Mainnet))
+        .await
+        .map_err(|e| anyhow::anyhow!("Failed to create InfoClient: {e:?}"))?;
+
+    let state = info
+        .user_state(wallet_address)
+        .await
+        .map_err(|e| anyhow::anyhow!("Failed to query user state: {e:?}"))?;
+
+    let positions: Vec<HlPosition> = state
+        .asset_positions
+        .iter()
+        .filter_map(|ap| {
+            let szi: f64 = ap.position.szi.parse().ok()?;
+            if szi.abs() < 1e-12 {
+                return None;
+            }
+            Some(HlPosition {
+                coin: ap.position.coin.clone(),
+                size: szi,
+                entry_px: ap.position.entry_px.as_ref()?.parse().ok()?,
+                unrealized_pnl: ap.position.unrealized_pnl.parse().unwrap_or(0.0),
+                leverage: ap.position.leverage.value as u8,
+            })
+        })
+        .collect();
+
+    let unrealized_pnl: f64 = positions.iter().map(|p| p.unrealized_pnl).sum();
+
+    // Spot clearinghouse: total USDC and available (total - hold).
+    // On unified accounts, all USDC lives in spot — perp withdrawable is 0.
+    let (spot_total, spot_available) = match info.user_token_balances(wallet_address).await {
+        Ok(balances) => {
+            let usdc = balances.balances.iter().find(|b| b.coin == "USDC");
+            let total = usdc.and_then(|b| b.total.parse::<f64>().ok()).unwrap_or(0.0);
+            let hold = usdc.and_then(|b| b.hold.parse::<f64>().ok()).unwrap_or(0.0);
+            (total, total - hold)
+        }
+        Err(e) => {
+            warn!("Failed to query spot balances: {e:?}");
+            (0.0, 0.0)
+        }
+    };
+
+    let total_equity = spot_total + unrealized_pnl;
+    Ok((total_equity, spot_available, positions))
+}
+
 /// Hyperliquid order executor — uses the official SDK for proper EIP-712 signing.
 pub struct HlExecutor {
     exchange: ExchangeClient,

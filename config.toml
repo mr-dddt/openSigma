@@ -8,12 +8,6 @@ kill_switch_drawdown_pct = 20.0
 [hyperliquid]
 max_leverage = 50
 
-[polymarket]
-max_bet_usd = 50.0
-max_hedge_ratio = 0.10
-prefer_maker_orders = true
-min_window_remaining_secs = 60
-
 [execution]
 max_trade_duration_secs = 600
 max_second_looks = 3

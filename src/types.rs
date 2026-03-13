@@ -10,14 +10,33 @@ use uuid::Uuid;
 pub enum Symbol {
     BTC,
     ETH,
+    SOL,
+    HYPE,
+    #[serde(rename = "CL-USDC")]
+    ClUsdc,
+}
+
+impl Symbol {
+    /// Coin string as used by Hyperliquid APIs.
+    pub fn hl_coin(&self) -> &'static str {
+        match self {
+            Symbol::BTC => "BTC",
+            Symbol::ETH => "ETH",
+            Symbol::SOL => "SOL",
+            Symbol::HYPE => "HYPE",
+            Symbol::ClUsdc => "CL/USDC",
+        }
+    }
+
+    /// All tradeable symbols.
+    pub fn all() -> &'static [Symbol] {
+        &[Symbol::BTC, Symbol::ETH, Symbol::SOL, Symbol::HYPE, Symbol::ClUsdc]
+    }
 }
 
 impl std::fmt::Display for Symbol {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            Symbol::BTC => write!(f, "BTC"),
-            Symbol::ETH => write!(f, "ETH"),
-        }
+        write!(f, "{}", self.hl_coin())
     }
 }
 
@@ -75,7 +94,7 @@ pub struct FundingTick {
     pub timestamp: DateTime<Utc>,
 }
 
-#[allow(dead_code)] // Phase 2 stub — will be wired when liquidation feed is added
+#[allow(dead_code)]
 #[derive(Debug, Clone)]
 pub struct LiquidationTick {
     pub symbol: Symbol,
@@ -97,37 +116,11 @@ pub struct Candle {
     pub timestamp: DateTime<Utc>,
 }
 
-/// Polymarket binary market odds.
-#[allow(dead_code)] // fields used by PM feed
-#[derive(Debug, Clone)]
-pub struct PmOdds {
-    pub market_id: String,
-    pub window: PmWindow,
-    pub up_price: f64,
-    pub down_price: f64,
-    pub timestamp: DateTime<Utc>,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-pub enum PmWindow {
-    FiveMin,
-    FifteenMin,
-}
-
-impl std::fmt::Display for PmWindow {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            PmWindow::FiveMin => write!(f, "5m"),
-            PmWindow::FifteenMin => write!(f, "15m"),
-        }
-    }
-}
-
 // ---------------------------------------------------------------------------
 // Unified market data event (sent through channels)
 // ---------------------------------------------------------------------------
 
-#[allow(dead_code)] // Liquidation and PmOdds variants are Phase 2 stubs
+#[allow(dead_code)] // Liquidation variant ready for future use
 #[derive(Debug, Clone)]
 pub enum MarketEvent {
     Price(PriceTick),
@@ -135,7 +128,6 @@ pub enum MarketEvent {
     OrderBook(OrderBookSnapshot),
     Funding(FundingTick),
     Liquidation(LiquidationTick),
-    PmOdds(PmOdds),
 }
 
 // ---------------------------------------------------------------------------
@@ -186,14 +178,12 @@ pub struct IndicatorValues {
     pub bb_lower: Option<f64>,
     pub bb_squeeze: bool,
     /// Price position within BB: -1.0 = lower band, 0.0 = SMA, +1.0 = upper band.
-    /// Values outside [-1, 1] = price broke through a band.
     pub bb_position: Option<f64>,
     pub bb_bandwidth: Option<f64>,
     pub atr_14: Option<f64>,
     pub atr_pct: Option<f64>,
     pub cvd: Option<f64>,
     pub ob_imbalance: Option<f64>,
-    pub pm_divergence: Option<f64>,
 }
 
 // ---------------------------------------------------------------------------
@@ -203,20 +193,12 @@ pub struct IndicatorValues {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub enum PlayType {
     PurePerpScalp,
-    PureBinaryBet,
-    HedgedPerp,
-    BinaryArbitrage,
-    CrossMarketMomentum,
 }
 
 impl std::fmt::Display for PlayType {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             PlayType::PurePerpScalp => write!(f, "PurePerpScalp"),
-            PlayType::PureBinaryBet => write!(f, "PureBinaryBet"),
-            PlayType::HedgedPerp => write!(f, "HedgedPerp"),
-            PlayType::BinaryArbitrage => write!(f, "BinaryArbitrage"),
-            PlayType::CrossMarketMomentum => write!(f, "CrossMarketMomentum"),
         }
     }
 }
@@ -230,7 +212,6 @@ pub enum LlmDecision {
         hl_leverage: Option<u8>,
         stop_loss_pct: f64,
         take_profit_pct: f64,
-        pm_hedge: Option<PmHedge>,
         reasoning: String,
     },
     Skip {
@@ -242,19 +223,6 @@ pub enum LlmDecision {
         original_bias: Direction,
         reasoning: String,
     },
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct PmHedge {
-    pub side: BinarySide,
-    pub budget_usd: f64,
-    pub max_price: f64,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-pub enum BinarySide {
-    Up,
-    Down,
 }
 
 // ---------------------------------------------------------------------------
@@ -302,7 +270,7 @@ pub struct TradeRecord {
 // Execution types
 // ---------------------------------------------------------------------------
 
-#[allow(dead_code)] // symbol and pm_hedge will be used when multi-asset + PM hedge is wired
+#[allow(dead_code)] // symbol will be used for multi-symbol execution
 #[derive(Debug, Clone)]
 pub struct ActiveTrade {
     pub id: Uuid,
@@ -316,7 +284,6 @@ pub struct ActiveTrade {
     pub take_profit_pct: f64,
     pub opened_at: DateTime<Utc>,
     pub max_hold_secs: u64,
-    pub pm_hedge: Option<PmHedge>,
     pub llm_reasoning: String,
     pub signal_level: SignalLevel,
     pub signal_score: i32,

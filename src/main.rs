@@ -23,11 +23,9 @@ use crate::agent::tuner::{SignalTuner, TuneTrigger};
 use crate::config::{Config, Secrets};
 use crate::data::hyperliquid::{self, HyperliquidFeed};
 use crate::data::news::NewsFeed;
-use crate::data::polymarket::PolymarketFeed;
-use crate::execution::hyperliquid::HlExecutor;
+use crate::execution::hyperliquid::{HlExecutor, HlPosition, query_account_state};
 use ethers::signers::Signer as _;
 use crate::execution::kill_switch::KillSwitch;
-use crate::execution::polymarket::PmExecutor;
 use crate::execution::position_monitor::{PositionEvent, PositionMonitor};
 use crate::execution::risk::RiskChecker;
 use crate::journal::logger::TradeLogger;
@@ -108,18 +106,13 @@ async fn main() -> Result<()> {
     let hl_feed = HyperliquidFeed::new(market_tx.clone());
     tokio::spawn(async move { hl_feed.run().await });
 
-    let pm_feed = PolymarketFeed::new(market_tx.clone());
-    tokio::spawn(async move { pm_feed.run().await });
-
     let mut news_feed = NewsFeed::new();
     tokio::spawn(async move { news_feed.run().await });
 
-    // Initialize components
+    // Initialize signal aggregator (BTC only)
     let mut aggregator = SignalAggregator::new();
 
-    // Pre-load historical candles to eliminate warm-up delay.
-    // 200 x 1m candles and 200 x 5m candles give all indicators
-    // full history from the first tick.
+    // Pre-load historical candles for BTC
     info!("Loading historical candles from Hyperliquid...");
     match hyperliquid::fetch_historical_candles("BTC", "1m", 200).await {
         Ok(candles) => {
@@ -127,9 +120,9 @@ async fn main() -> Result<()> {
             for c in candles {
                 aggregator.indicators.push_candle_1m(c);
             }
-            info!(count, "1m candles loaded — EMA, StochRSI ready");
+            info!(count, "1m candles loaded");
         }
-        Err(e) => warn!("Failed to load 1m candles (will warm up from live): {e:#}"),
+        Err(e) => warn!("Failed to load 1m candles: {e:#}"),
     }
     match hyperliquid::fetch_historical_candles("BTC", "5m", 200).await {
         Ok(candles) => {
@@ -138,9 +131,9 @@ async fn main() -> Result<()> {
             for c in candles {
                 aggregator.indicators.push_candle_5m(c);
             }
-            info!(count, "5m candles loaded — RSI, ATR, BB, CVD ready");
+            info!(count, "5m candles loaded");
         }
-        Err(e) => warn!("Failed to load 5m candles (will warm up from live): {e:#}"),
+        Err(e) => warn!("Failed to load 5m candles: {e:#}"),
     }
 
     let memory = Arc::new(MemoryManager::new("memory/memory.md"));
@@ -182,8 +175,6 @@ async fn main() -> Result<()> {
             None
         }
     };
-    let pm_executor = PmExecutor::new(&secrets.pm_api_key, &secrets.pm_api_secret, &secrets.pm_passphrase);
-
     // Fetch real exchange balance at startup for accurate daily PnL tracking.
     // Falls back to config.capital.initial_usd if exchange queries fail.
     let startup_hl_equity = if let Some(ref hl) = hl_executor {
@@ -191,9 +182,8 @@ async fn main() -> Result<()> {
     } else {
         0.0
     };
-    let startup_pm_balance = pm_executor.account_balance().await.unwrap_or(0.0);
     let initial_usd = {
-        let real = startup_hl_equity + startup_pm_balance;
+        let real = startup_hl_equity;
         if real > 0.0 {
             info!(real_balance = real, "Using real exchange balance as starting equity");
             real
@@ -206,7 +196,8 @@ async fn main() -> Result<()> {
 
     // Startup reconciliation: detect positions left open from previous run.
     // Uses ATR-based TP/SL if available, otherwise defaults to 0.2%/0.3%.
-    let recovered_sl = aggregator.indicators.atr_pct(71000.0).unwrap_or(0.2).min(0.3);
+    let recovered_sl = aggregator.indicators.atr_pct(71000.0)
+        .unwrap_or(0.2).min(0.3);
     let recovered_tp = (recovered_sl * 1.7).min(0.5);
     if let Some(ref hl) = hl_executor {
         match hl.positions().await {
@@ -226,7 +217,7 @@ async fn main() -> Result<()> {
                         take_profit_pct: recovered_tp,
                         opened_at: chrono::Utc::now(),
                         max_hold_secs: config.execution.max_trade_duration_secs,
-                        pm_hedge: None,
+
                         llm_reasoning: "Recovered from previous session".to_string(),
                         signal_level: SignalLevel::Weak,
                         signal_score: 0,
@@ -256,107 +247,76 @@ async fn main() -> Result<()> {
     let tui_tx_clone = tui_tx.clone();
     let config_for_engine = shared_config.clone();
 
-    // Shared real balance — updated by poller, read by engine for risk calculations
+    // Shared state — updated by poller, read by engine for risk + LLM context
     let shared_balance = Arc::new(RwLock::new(0.0f64));
     let balance_for_engine = shared_balance.clone();
+    let shared_hl_positions: Arc<RwLock<Vec<HlPosition>>> = Arc::new(RwLock::new(Vec::new()));
+    let hl_positions_for_engine = shared_hl_positions.clone();
 
-    // Spawn balance poller (queries HL + PM every 30s)
+    // Spawn account state poller (queries HL SDK every 15s for balances + positions)
     {
         let tui_tx_bal = tui_tx.clone();
         let hl_key = secrets.hl_private_key.clone();
-        let pm_api_key = secrets.pm_api_key.clone();
-        let pm_api_secret = secrets.pm_api_secret.clone();
-        let pm_passphrase = secrets.pm_passphrase.clone();
         let bal_write = shared_balance.clone();
+        let pos_write = shared_hl_positions.clone();
         tokio::spawn(async move {
-            let mut interval = tokio::time::interval(tokio::time::Duration::from_secs(30));
-            let http = reqwest::Client::new();
-            let pm = PmExecutor::new(&pm_api_key, &pm_api_secret, &pm_passphrase);
+            let mut interval = tokio::time::interval(tokio::time::Duration::from_secs(15));
 
             let wallet_address = match hl_key.parse::<ethers::signers::LocalWallet>() {
-                Ok(w) => format!("{:?}", w.address()),
-                Err(_) => String::new(),
+                Ok(w) => w.address(),
+                Err(_) => {
+                    warn!("Failed to parse HL key for balance poller");
+                    return;
+                }
             };
 
             loop {
                 interval.tick().await;
-                if wallet_address.is_empty() {
-                    continue;
+
+                // Query HL via SDK: total equity, available USDC, and all positions
+                match query_account_state(wallet_address).await {
+                    Ok((hl_equity, hl_available, positions)) => {
+                        let total = hl_equity;
+
+                        // Update shared state for engine
+                        *bal_write.write().await = total;
+                        *pos_write.write().await = positions.clone();
+
+                        // Convert HL positions to TUI format
+                        let tui_positions: Vec<PositionInfo> = positions.iter().map(|p| {
+                            let direction = if p.size > 0.0 { Direction::Long } else { Direction::Short };
+                            PositionInfo {
+                                coin: p.coin.clone(),
+                                direction,
+                                entry_price: p.entry_px,
+                                notional: p.size.abs() * p.entry_px,
+                                leverage: p.leverage,
+                                unrealized_pnl: p.unrealized_pnl,
+                            }
+                        }).collect();
+
+                        let _ = tui_tx_bal.send(TuiUpdate::Positions(tui_positions)).await;
+                        let _ = tui_tx_bal.send(TuiUpdate::Balances(ExchangeBalances {
+                            hl_equity,
+                            hl_available,
+                        })).await;
+                    }
+                    Err(e) => {
+                        warn!("HL account state query failed: {e:#}");
+                    }
                 }
-
-                // Query perp clearinghouse for unrealized PnL only
-                let unrealized_pnl = match http
-                    .post("https://api.hyperliquid.xyz/info")
-                    .json(&serde_json::json!({
-                        "type": "clearinghouseState",
-                        "user": &wallet_address
-                    }))
-                    .send()
-                    .await
-                {
-                    Ok(resp) => {
-                        let body: serde_json::Value = resp.json().await.unwrap_or_default();
-                        // Sum unrealizedPnl from all positions
-                        body.get("assetPositions")
-                            .and_then(|v| v.as_array())
-                            .map(|positions| {
-                                positions.iter()
-                                    .filter_map(|p| {
-                                        p.pointer("/position/unrealizedPnl")
-                                            .and_then(|v| v.as_str())
-                                            .and_then(|s| s.parse::<f64>().ok())
-                                    })
-                                    .sum::<f64>()
-                            })
-                            .unwrap_or(0.0)
-                    }
-                    Err(_) => 0.0,
-                };
-
-                // Query spot clearinghouse for USDC balance (unified accounts
-                // store all funds here, including margin allocated to perps).
-                let spot_usdc = match http
-                    .post("https://api.hyperliquid.xyz/info")
-                    .json(&serde_json::json!({
-                        "type": "spotClearinghouseState",
-                        "user": &wallet_address
-                    }))
-                    .send()
-                    .await
-                {
-                    Ok(resp) => {
-                        let body: serde_json::Value = resp.json().await.unwrap_or_default();
-                        body.get("balances")
-                            .and_then(|b| b.as_array())
-                            .and_then(|arr| arr.iter().find(|e| e.get("coin").and_then(|c| c.as_str()) == Some("USDC")))
-                            .and_then(|e| e.get("total"))
-                            .and_then(|v| v.as_str())
-                            .and_then(|s| s.parse::<f64>().ok())
-                            .unwrap_or(0.0)
-                    }
-                    Err(_) => 0.0,
-                };
-
-                // Unified account: spot USDC has all funds (incl. margin), add only unrealized PnL
-                let hl_eq = spot_usdc + unrealized_pnl;
-                tracing::debug!(spot_usdc, unrealized_pnl, hl_eq, "HL balance poll");
-
-                let pm_bal = pm.account_balance().await.unwrap_or(0.0);
-                let total = hl_eq + pm_bal;
-
-                // Update shared balance for risk engine
-                *bal_write.write().await = total;
-
-                let _ = tui_tx_bal.send(TuiUpdate::Balances(ExchangeBalances {
-                    hl_equity: hl_eq,
-                    pm_balance: pm_bal,
-                })).await;
             }
         });
     }
 
     // Spawn the market event processor + signal engine + LLM gate
     tokio::spawn(async move {
+        const LLM_SKIP_COOLDOWN_SECS: i64 = 20;
+        const LLM_EXECUTE_COOLDOWN_SECS: i64 = 45;
+        let mut llm_cooldown_until: Option<chrono::DateTime<chrono::Utc>> = None;
+
+        let mut latest_price: f64 = 0.0;
+
         loop {
             tokio::select! {
                 Some(event) = market_rx.recv() => {
@@ -364,118 +324,98 @@ async fn main() -> Result<()> {
                         MarketEvent::Price(tick) => {
                             if tick.symbol == Symbol::BTC {
                                 aggregator.update_price(tick.price);
+                                latest_price = tick.price;
                                 let _ = tui_tx_clone.send(TuiUpdate::Price(tick.price)).await;
+                            }
 
-                                // Check position price levels
-                                // Software-side stop/TP monitoring. HL also has trigger orders
-                                // for the same levels. remove_trade() guards against double-processing.
-                                // TODO: after SDK integration, subscribe to HL order fills to detect
-                                // exchange-side closes and cancel redundant trigger orders.
-                                let events = position_monitor.check_price_levels(tick.price);
-                                for pe in events {
-                                    match pe {
-                                        PositionEvent::StopHit(id) | PositionEvent::TakeProfitHit(id) => {
-                                            let reason = match pe {
-                                                PositionEvent::StopHit(_) => "stop_loss",
-                                                PositionEvent::TakeProfitHit(_) => "take_profit",
-                                                _ => "unknown",
+                            // Check position stop/TP levels
+                            let events = position_monitor.check_price_levels(latest_price);
+                            for pe in events {
+                                match pe {
+                                    PositionEvent::StopHit(id) | PositionEvent::TakeProfitHit(id) => {
+                                        let reason = match pe {
+                                            PositionEvent::StopHit(_) => "stop_loss",
+                                            PositionEvent::TakeProfitHit(_) => "take_profit",
+                                            _ => "unknown",
+                                        };
+                                        if let Some(trade) = position_monitor.remove_trade(&id) {
+                                            let exit_price = latest_price;
+                                            let pnl = match trade.direction {
+                                                Direction::Long => (exit_price - trade.entry_price) / trade.entry_price * trade.size_usd,
+                                                Direction::Short => (trade.entry_price - exit_price) / trade.entry_price * trade.size_usd,
                                             };
-                                            if let Some(trade) = position_monitor.remove_trade(&id) {
-                                                let pnl = match trade.direction {
-                                                    Direction::Long => (tick.price - trade.entry_price) / trade.entry_price * trade.size_usd,
-                                                    Direction::Short => (trade.entry_price - tick.price) / trade.entry_price * trade.size_usd,
-                                                };
-                                                risk.record_trade_pnl(pnl);
-                                                let pnl_pct = if initial_usd > 0.0 { (risk.current_equity() - initial_usd) / initial_usd * 100.0 } else { 0.0 };
-                                                aggregator.update_daily_pnl(pnl_pct);
-                                                tuner.record_trade();
+                                            risk.record_trade_pnl(pnl);
+                                            let pnl_pct = if initial_usd > 0.0 { (risk.current_equity() - initial_usd) / initial_usd * 100.0 } else { 0.0 };
+                                            aggregator.update_daily_pnl(pnl_pct);
+                                            tuner.record_trade();
 
-                                                let record = TradeRecord {
-                                                    id: trade.id,
-                                                    ts_open: trade.opened_at,
-                                                    ts_close: Some(chrono::Utc::now()),
-                                                    duration_secs: Some((chrono::Utc::now() - trade.opened_at).num_seconds() as u64),
-                                                    play_type: trade.play_type,
-                                                    direction: trade.direction,
-                                                    signal_level: trade.signal_level,
-                                                    signal_score: trade.signal_score,
-                                                    entry_price: trade.entry_price,
-                                                    exit_price: Some(tick.price),
-                                                    size_usd: trade.size_usd,
-                                                    leverage: trade.leverage,
-                                                    pnl_usd: Some(pnl),
-                                                    exit_reason: Some(reason.to_string()),
-                                                    llm_reasoning: trade.llm_reasoning.clone(),
-                                                    capital_after: Some(risk.current_equity()),
-                                                };
-                                                let _ = journal.log_entry(&record);
+                                            let record = TradeRecord {
+                                                id: trade.id,
+                                                ts_open: trade.opened_at,
+                                                ts_close: Some(chrono::Utc::now()),
+                                                duration_secs: Some((chrono::Utc::now() - trade.opened_at).num_seconds() as u64),
+                                                play_type: trade.play_type,
+                                                direction: trade.direction,
+                                                signal_level: trade.signal_level,
+                                                signal_score: trade.signal_score,
+                                                entry_price: trade.entry_price,
+                                                exit_price: Some(exit_price),
+                                                size_usd: trade.size_usd,
+                                                leverage: trade.leverage,
+                                                pnl_usd: Some(pnl),
+                                                exit_reason: Some(reason.to_string()),
+                                                llm_reasoning: trade.llm_reasoning.clone(),
+                                                capital_after: Some(risk.current_equity()),
+                                            };
+                                            let _ = journal.log_entry(&record);
 
-                                                // Telegram alert on trade close
-                                                if let Some(ref tg) = telegram {
-                                                    let r = record.clone();
-                                                    let tg_ref = tg.clone();
-                                                    tokio::spawn(async move { tg_ref.send_trade_close(&r).await });
-                                                }
-
-                                                let _ = tui_tx_clone.send(TuiUpdate::Log(format!(
-                                                    "[{}] {} closed ({}) PnL: ${:.2}",
-                                                    chrono::Utc::now().format("%H:%M:%S"),
-                                                    trade.direction, reason, pnl,
-                                                ))).await;
-
-                                                // Send updated stats
-                                                let _ = tui_tx_clone.send(TuiUpdate::Stats(PerformanceStats {
-                                                    total_trades: risk.total_closed(),
-                                                    win_rate: risk.win_rate(),
-                                                    total_pnl: risk.current_equity() - initial_usd,
-                                                    streak: risk.streak(),
-                                                })).await;
+                                            if let Some(ref tg) = telegram {
+                                                let r = record.clone();
+                                                let tg_ref = tg.clone();
+                                                tokio::spawn(async move { tg_ref.send_trade_close(&r).await });
                                             }
-                                        }
-                                        _ => {}
-                                    }
-                                }
-                                {
-                                    let c = config_for_engine.read().await;
-                                    risk.set_open_positions(position_monitor.open_count(), &c);
-                                }
 
-                                // Send position updates to TUI
-                                let pos_infos: Vec<PositionInfo> = position_monitor.active_trades().iter().map(|t| {
-                                    let pnl = match t.direction {
-                                        Direction::Long => (tick.price - t.entry_price) / t.entry_price * t.size_usd,
-                                        Direction::Short => (t.entry_price - tick.price) / t.entry_price * t.size_usd,
-                                    };
-                                    PositionInfo {
-                                        id: t.id,
-                                        direction: t.direction,
-                                        play_type: t.play_type,
-                                        entry_price: t.entry_price,
-                                        size_usd: t.size_usd,
-                                        leverage: t.leverage.unwrap_or(1),
-                                        unrealized_pnl: pnl,
-                                        duration_secs: (chrono::Utc::now() - t.opened_at).num_seconds().max(0) as u64,
+                                            let _ = tui_tx_clone.send(TuiUpdate::Log(format!(
+                                                "[{}] {} {} closed ({}) PnL: ${:.2}",
+                                                chrono::Utc::now().format("%H:%M:%S"),
+                                                trade.symbol, trade.direction, reason, pnl,
+                                            ))).await;
+
+                                            let _ = tui_tx_clone.send(TuiUpdate::Stats(PerformanceStats {
+                                                total_trades: risk.total_closed(),
+                                                win_rate: risk.win_rate(),
+                                                total_pnl: risk.current_equity() - initial_usd,
+                                                streak: risk.streak(),
+                                            })).await;
+                                        }
                                     }
-                                }).collect();
-                                let _ = tui_tx_clone.send(TuiUpdate::Positions(pos_infos)).await;
+                                    _ => {}
+                                }
+                            }
+                            {
+                                let c = config_for_engine.read().await;
+                                risk.set_open_positions(position_monitor.open_count(), &c);
                             }
                         }
                         MarketEvent::Trade(trade) => {
-                            let is_buy = trade.side == Direction::Long;
-                            aggregator.indicators.add_trade(trade.size, is_buy);
-                            aggregator.push_trade_for_candles(trade.price, trade.size, trade.timestamp);
+                            if trade.symbol == Symbol::BTC {
+                                let is_buy = trade.side == Direction::Long;
+                                aggregator.indicators.add_trade(trade.size, is_buy);
+                                aggregator.push_trade_for_candles(trade.price, trade.size, trade.timestamp);
+                            }
                         }
                         MarketEvent::OrderBook(book) => {
-                            let imbalance = Indicators::ob_imbalance(&book.bids, &book.asks, 10);
-                            aggregator.update_ob_imbalance(imbalance);
+                            if book.symbol == Symbol::BTC {
+                                let imbalance = Indicators::ob_imbalance(&book.bids, &book.asks, 10);
+                                aggregator.update_ob_imbalance(imbalance);
+                            }
                         }
                         MarketEvent::Funding(tick) => {
-                            aggregator.update_funding(tick.rate);
+                            if tick.symbol == Symbol::BTC {
+                                aggregator.update_funding(tick.rate);
+                            }
                         }
                         MarketEvent::Liquidation(_) => {}
-                        MarketEvent::PmOdds(odds) => {
-                            aggregator.update_pm_odds(odds.up_price);
-                        }
                     }
                 }
                 _ = eval_ticker.tick() => {
@@ -484,22 +424,23 @@ async fn main() -> Result<()> {
                     }
 
                     let cfg = config_for_engine.read().await;
+
+                    // Evaluate BTC signal
                     let snapshot = aggregator.evaluate(&cfg);
                     let _ = tui_tx_clone.send(TuiUpdate::Signal(snapshot.clone())).await;
+                    let has_signal = snapshot.level != SignalLevel::NoTrade && snapshot.level != SignalLevel::Weak;
 
                     // Check position expirations (max hold time)
                     let expired = position_monitor.check_expirations();
                     for id in expired {
                         if let Some(trade) = position_monitor.remove_trade(&id) {
-                            info!(id = %trade.id, "Position expired (max hold time)");
-                            // Close via executor if available
-                            let current_price = aggregator.latest_price();
+                            info!(id = %trade.id, symbol = %trade.symbol, "Position expired (max hold time)");
+                            let current_price = latest_price;
                             if let Some(ref hl) = hl_executor {
                                 let is_buy = trade.direction == Direction::Short;
                                 let sz = trade.size_usd / trade.entry_price;
-                                let _ = hl.market_order("BTC", is_buy, sz, trade.leverage.unwrap_or(1)).await;
+                                let _ = hl.market_order(trade.symbol.hl_coin(), is_buy, sz, trade.leverage.unwrap_or(1)).await;
                             }
-                            // Compute PnL for expired trade
                             let pnl = match trade.direction {
                                 Direction::Long => (current_price - trade.entry_price) / trade.entry_price * trade.size_usd,
                                 Direction::Short => (trade.entry_price - current_price) / trade.entry_price * trade.size_usd,
@@ -531,9 +472,9 @@ async fn main() -> Result<()> {
                             let _ = journal.log_entry(&record);
 
                             let _ = tui_tx_clone.send(TuiUpdate::Log(format!(
-                                "[{}] Position {} expired — force closed, PnL: ${:.2}",
+                                "[{}] {} position expired — force closed, PnL: ${:.2}",
                                 chrono::Utc::now().format("%H:%M:%S"),
-                                trade.id, pnl,
+                                trade.symbol, pnl,
                             ))).await;
                         }
                     }
@@ -544,38 +485,39 @@ async fn main() -> Result<()> {
                     for entry in due_entries {
                         info!(bias = %entry.original_bias, attempt = entry.attempt, "SecondLook re-evaluation");
                         let sl_snapshot = aggregator.evaluate(&cfg);
-                        match llm_gate.evaluate(&sl_snapshot, &cfg).await {
+                        let hl_pos = hl_positions_for_engine.read().await;
+                        let sl_pos_ctx = build_position_context(&hl_pos, &risk, &cfg);
+                        match llm_gate.evaluate(&sl_snapshot, &cfg, &sl_pos_ctx).await {
                             Ok(decision) => {
                                 handle_llm_decision(
                                     &decision, &sl_snapshot, &cfg,
                                     &mut risk, &mut position_monitor, &mut second_look,
                                     &mut tuner, &hl_executor, &journal, &tui_tx_clone,
-                                    &telegram,
+                                    &telegram, latest_price,
                                 ).await;
                             }
                             Err(e) => warn!("SecondLook LLM error: {e:#}"),
                         }
                     }
 
-                    // Sync real balance from exchange poller
+                    // Sync real balance + position count from exchange poller
                     {
                         let real_bal = *balance_for_engine.read().await;
                         if real_bal > 0.0 {
                             risk.sync_balance(real_bal);
                         }
+                        let hl_pos_count = hl_positions_for_engine.read().await.len() as u32;
+                        risk.set_open_positions(hl_pos_count, &cfg);
+                        risk.maybe_reset_day();
                     }
 
                     // Main signal evaluation → LLM gate
-                    // When at max positions, skip scanning entirely — focus on
-                    // managing exits via position monitor instead of spamming logs.
                     if risk.is_at_max_positions() {
-                        // Still evaluate positions (stop/TP/expiry handled above),
-                        // but don't scan for new entries.
-                    } else if snapshot.level != SignalLevel::NoTrade && snapshot.level != SignalLevel::Weak {
+                        // At capacity — manage exits only
+                    } else if has_signal {
                         tuner.record_signal_pass();
 
                         if let Err(reason) = risk.can_trade(&cfg) {
-                            // Only log non-cooldown risk blocks (cooldown spams every 5s)
                             if !reason.starts_with("Cooldown") {
                                 let _ = tui_tx_clone.send(TuiUpdate::Log(format!(
                                     "[{}] Risk block: {}",
@@ -584,28 +526,45 @@ async fn main() -> Result<()> {
                                 ))).await;
                             }
                         } else {
-                            let _ = tui_tx_clone.send(TuiUpdate::Log(format!(
-                                "[{}] {} (net={}) → LLM gate...",
-                                chrono::Utc::now().format("%H:%M:%S"),
-                                snapshot.level,
-                                snapshot.net_score,
-                            ))).await;
+                            let now = chrono::Utc::now();
+                            let cooldown_active = llm_cooldown_until
+                                .map(|t| now < t)
+                                .unwrap_or(false);
 
-                            match llm_gate.evaluate(&snapshot, &cfg).await {
-                                Ok(decision) => {
-                                    handle_llm_decision(
-                                        &decision, &snapshot, &cfg,
-                                        &mut risk, &mut position_monitor, &mut second_look,
-                                        &mut tuner, &hl_executor, &journal, &tui_tx_clone,
-                                        &telegram,
-                                    ).await;
-                                }
-                                Err(e) => {
-                                    warn!("LLM gate error: {e:#}");
-                                    let _ = tui_tx_clone.send(TuiUpdate::Log(format!(
-                                        "[{}] LLM error: {e}",
-                                        chrono::Utc::now().format("%H:%M:%S"),
-                                    ))).await;
+                            if !cooldown_active {
+                                let _ = tui_tx_clone.send(TuiUpdate::Log(format!(
+                                    "[{}] BTC {} (net={}) → LLM gate...",
+                                    now.format("%H:%M:%S"),
+                                    snapshot.level, snapshot.net_score,
+                                ))).await;
+
+                                let hl_pos = hl_positions_for_engine.read().await;
+                                let pos_ctx = build_position_context(&hl_pos, &risk, &cfg);
+
+                                match llm_gate.evaluate(&snapshot, &cfg, &pos_ctx).await {
+                                    Ok(decision) => {
+                                        let cd_secs = match &decision {
+                                            LlmDecision::Skip { .. } => LLM_SKIP_COOLDOWN_SECS,
+                                            LlmDecision::Execute { .. } => LLM_EXECUTE_COOLDOWN_SECS,
+                                            LlmDecision::SecondLook { .. } => 0,
+                                        };
+                                        if cd_secs > 0 {
+                                            llm_cooldown_until = Some(chrono::Utc::now() + chrono::Duration::seconds(cd_secs));
+                                        }
+                                        handle_llm_decision(
+                                            &decision, &snapshot, &cfg,
+                                            &mut risk, &mut position_monitor, &mut second_look,
+                                            &mut tuner, &hl_executor, &journal, &tui_tx_clone,
+                                            &telegram, latest_price,
+                                        ).await;
+                                    }
+                                    Err(e) => {
+                                        warn!("LLM gate error: {e:#}");
+                                        let _ = tui_tx_clone.send(TuiUpdate::Log(format!(
+                                            "[{}] LLM error: {e}",
+                                            chrono::Utc::now().format("%H:%M:%S"),
+                                        ))).await;
+                                    }
                                 }
                             }
                         }
@@ -685,7 +644,6 @@ async fn main() -> Result<()> {
                             if let Some(ref hl) = hl_executor {
                                 let _ = hl.close_all().await;
                             }
-                            let _ = pm_executor.cancel_all().await;
                             let _ = tui_tx_clone.send(TuiUpdate::Log(format!(
                                 "[{}] KILL SWITCH — drawdown limit hit",
                                 chrono::Utc::now().format("%H:%M:%S"),
@@ -764,6 +722,7 @@ async fn handle_llm_decision(
     journal: &TradeLogger,
     tui_tx: &mpsc::Sender<TuiUpdate>,
     telegram: &Option<TelegramClient>,
+    latest_price: f64,
 ) {
     match decision {
         LlmDecision::Execute {
@@ -773,7 +732,6 @@ async fn handle_llm_decision(
             hl_leverage,
             stop_loss_pct,
             take_profit_pct,
-            pm_hedge,
             reasoning,
         } => {
             // Validate against hard risk limits
@@ -804,11 +762,11 @@ async fn handle_llm_decision(
                             let sz = opp_trade.size_usd / opp_trade.entry_price;
                             let _ = hl.market_order("BTC", is_buy, sz, opp_trade.leverage.unwrap_or(1)).await;
                         }
-                        let current_price = snapshot.indicators.ema_9.unwrap_or(0.0);
-                        let lev = opp_trade.leverage.unwrap_or(1) as f64;
+                        let current_price = latest_price;
+                        // size_usd is notional (margin × leverage), so no extra lev multiplier
                         let pnl = match opp_trade.direction {
-                            Direction::Long => (current_price - opp_trade.entry_price) / opp_trade.entry_price * opp_trade.size_usd * lev,
-                            Direction::Short => (opp_trade.entry_price - current_price) / opp_trade.entry_price * opp_trade.size_usd * lev,
+                            Direction::Long => (current_price - opp_trade.entry_price) / opp_trade.entry_price * opp_trade.size_usd,
+                            Direction::Short => (opp_trade.entry_price - current_price) / opp_trade.entry_price * opp_trade.size_usd,
                         };
                         risk.record_trade_pnl(pnl);
                         let record = TradeRecord {
@@ -907,7 +865,6 @@ async fn handle_llm_decision(
                 take_profit_pct: *take_profit_pct,
                 opened_at: chrono::Utc::now(),
                 max_hold_secs: config.execution.max_trade_duration_secs,
-                pm_hedge: pm_hedge.clone(),
                 llm_reasoning: reasoning.clone(),
                 signal_level: snapshot.level,
                 signal_score: snapshot.net_score,
@@ -993,4 +950,77 @@ async fn handle_llm_decision(
             }
         }
     }
+}
+
+/// Build portfolio + position context for LLM using real HL data.
+fn build_position_context(
+    hl_positions: &[HlPosition],
+    risk: &RiskChecker,
+    config: &Config,
+) -> String {
+    let equity = risk.current_equity();
+
+    // Portfolio-level summary
+    let mut lines = vec![format!(
+        "PORTFOLIO: equity=${:.2} | daily_loss=${:.2} | max_daily_loss={:.1}% | session_trades={} | win_rate={:.0}% | streak={}",
+        equity,
+        risk.daily_loss_usd(),
+        config.capital.max_daily_loss_pct,
+        risk.total_closed(),
+        risk.win_rate() * 100.0,
+        risk.streak(),
+    )];
+
+    if hl_positions.is_empty() {
+        lines.push("Open positions: NONE (0 exposure)".to_string());
+        return lines.join("\n");
+    }
+
+    // Aggregate metrics from real HL positions
+    let mut total_notional = 0.0;
+    let mut total_margin = 0.0;
+    let mut total_pnl = 0.0;
+    let mut long_count = 0u32;
+    let mut short_count = 0u32;
+    let mut long_margin = 0.0;
+    let mut short_margin = 0.0;
+
+    let mut position_lines = Vec::new();
+    for p in hl_positions {
+        let notional = p.size.abs() * p.entry_px;
+        let margin = if p.leverage > 0 { notional / p.leverage as f64 } else { notional };
+        total_notional += notional;
+        total_margin += margin;
+        total_pnl += p.unrealized_pnl;
+        let dir = if p.size > 0.0 { "Long" } else { "Short" };
+        if p.size > 0.0 {
+            long_count += 1;
+            long_margin += margin;
+        } else {
+            short_count += 1;
+            short_margin += margin;
+        }
+        position_lines.push(format!(
+            "  {} {} notional=${:.0} margin=${:.2} @{:.2} lev={} PnL=${:+.2}",
+            dir, p.coin, notional, margin, p.entry_px, p.leverage, p.unrealized_pnl,
+        ));
+    }
+
+    // margin_heat = total margin / equity — represents actual capital at risk
+    let margin_heat_pct = if equity > 0.0 { total_margin / equity * 100.0 } else { 0.0 };
+
+    lines.push(format!(
+        "EXPOSURE: {} positions ({}L/{}S) | margin_used=${:.2} | margin_heat={:.1}% of equity | notional=${:.0} | aggregate_PnL=${:+.2}",
+        hl_positions.len(), long_count, short_count,
+        total_margin, margin_heat_pct, total_notional, total_pnl,
+    ));
+    if long_margin > 0.0 {
+        lines.push(format!("  Long: ${:.2} margin across {} position(s)", long_margin, long_count));
+    }
+    if short_margin > 0.0 {
+        lines.push(format!("  Short: ${:.2} margin across {} position(s)", short_margin, short_count));
+    }
+    lines.push("Positions (from HL):".to_string());
+    lines.extend(position_lines);
+    lines.join("\n")
 }
