@@ -1,5 +1,5 @@
 [capital]
-initial_usd = 5000.0
+initial_usd = 50.0
 max_trade_pct = 3.0
 max_concurrent_positions = 2
 max_daily_loss_pct = 5.0
