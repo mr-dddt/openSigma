@@ -56,9 +56,10 @@ impl HlExecutor {
         sz: f64,
         leverage: u8,
     ) -> Result<OrderResult> {
-        // Set leverage first
+        // Set leverage with isolated margin — each position has its own
+        // margin and liquidation price, preventing cascading liquidations.
         self.exchange
-            .update_leverage(leverage as u32, coin, true, None)
+            .update_leverage(leverage as u32, coin, false, None)
             .await
             .map_err(|e| anyhow::anyhow!("Failed to set leverage: {e:?}"))?;
 

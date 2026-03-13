@@ -1,7 +1,7 @@
 [capital]
 initial_usd = 50.0
 max_trade_pct = 10.0
-max_concurrent_positions = 4
+max_concurrent_positions = 10
 max_daily_loss_pct = 10.0
 kill_switch_drawdown_pct = 20.0
 
