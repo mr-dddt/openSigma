@@ -195,20 +195,23 @@ async fn main() -> Result<()> {
     let tui_tx_clone = tui_tx.clone();
     let config_for_engine = shared_config.clone();
 
+    // Shared real balance — updated by poller, read by engine for risk calculations
+    let shared_balance = Arc::new(RwLock::new(0.0f64));
+    let balance_for_engine = shared_balance.clone();
+
     // Spawn balance poller (queries HL + PM every 30s)
-    // Uses lightweight REST calls — no SDK re-init needed.
     {
         let tui_tx_bal = tui_tx.clone();
         let hl_key = secrets.hl_private_key.clone();
         let pm_api_key = secrets.pm_api_key.clone();
         let pm_api_secret = secrets.pm_api_secret.clone();
         let pm_passphrase = secrets.pm_passphrase.clone();
+        let bal_write = shared_balance.clone();
         tokio::spawn(async move {
             let mut interval = tokio::time::interval(tokio::time::Duration::from_secs(30));
             let http = reqwest::Client::new();
             let pm = PmExecutor::new(&pm_api_key, &pm_api_secret, &pm_passphrase);
 
-            // Derive wallet address from private key once
             let wallet_address = match hl_key.parse::<ethers::signers::LocalWallet>() {
                 Ok(w) => format!("{:?}", w.address()),
                 Err(_) => String::new(),
@@ -220,7 +223,6 @@ async fn main() -> Result<()> {
                     continue;
                 }
 
-                // Query HL balance via lightweight REST (no SDK needed)
                 let hl_eq = match http
                     .post("https://api.hyperliquid.xyz/info")
                     .json(&serde_json::json!({
@@ -241,6 +243,11 @@ async fn main() -> Result<()> {
                 };
 
                 let pm_bal = pm.account_balance().await.unwrap_or(0.0);
+                let total = hl_eq + pm_bal;
+
+                // Update shared balance for risk engine
+                *bal_write.write().await = total;
+
                 let _ = tui_tx_bal.send(TuiUpdate::Balances(ExchangeBalances {
                     hl_equity: hl_eq,
                     pm_balance: pm_bal,
@@ -330,7 +337,10 @@ async fn main() -> Result<()> {
                                         _ => {}
                                     }
                                 }
-                                risk.set_open_positions(position_monitor.open_count());
+                                {
+                                    let c = config_for_engine.read().await;
+                                    risk.set_open_positions(position_monitor.open_count(), &c);
+                                }
 
                                 // Send position updates to TUI
                                 let pos_infos: Vec<PositionInfo> = position_monitor.active_trades().iter().map(|t| {
@@ -430,7 +440,7 @@ async fn main() -> Result<()> {
                             ))).await;
                         }
                     }
-                    risk.set_open_positions(position_monitor.open_count());
+                    risk.set_open_positions(position_monitor.open_count(), &cfg);
 
                     // Check SecondLook due entries
                     let due_entries = second_look.poll_due();
@@ -450,8 +460,21 @@ async fn main() -> Result<()> {
                         }
                     }
 
+                    // Sync real balance from exchange poller
+                    {
+                        let real_bal = *balance_for_engine.read().await;
+                        if real_bal > 0.0 {
+                            risk.sync_balance(real_bal);
+                        }
+                    }
+
                     // Main signal evaluation → LLM gate
-                    if snapshot.level != SignalLevel::NoTrade && snapshot.level != SignalLevel::Weak {
+                    // When at max positions, skip scanning entirely — focus on
+                    // managing exits via position monitor instead of spamming logs.
+                    if risk.is_at_max_positions() {
+                        // Still evaluate positions (stop/TP/expiry handled above),
+                        // but don't scan for new entries.
+                    } else if snapshot.level != SignalLevel::NoTrade && snapshot.level != SignalLevel::Weak {
                         tuner.record_signal_pass();
 
                         if let Err(reason) = risk.can_trade(&cfg) {
@@ -598,7 +621,9 @@ async fn main() -> Result<()> {
                 TuiUpdate::Log(l) => app.push_log(l),
                 TuiUpdate::Positions(p) => app.update_positions(p),
                 TuiUpdate::Stats(s) => app.update_stats(s),
-                TuiUpdate::Balances(b) => app.update_balances(b),
+                TuiUpdate::Balances(b) => {
+                    app.update_balances(b);
+                }
             }
         }
 
@@ -733,7 +758,7 @@ async fn handle_llm_decision(
             let trade_id = trade.id;
             let trade_opened_at = trade.opened_at;
             position_monitor.add_trade(trade);
-            risk.set_open_positions(position_monitor.open_count());
+            risk.set_open_positions(position_monitor.open_count(), config);
 
             // Journal the open trade
             let open_record = TradeRecord {

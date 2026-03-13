@@ -3,6 +3,7 @@ use crate::types::LlmDecision;
 use tracing::warn;
 
 /// Hard risk checks that the LLM cannot override.
+/// Uses real exchange balance (synced from balance poller) for all calculations.
 pub struct RiskChecker {
     daily_loss_usd: f64,
     peak_equity: f64,
@@ -10,32 +11,54 @@ pub struct RiskChecker {
     open_positions: u32,
     total_wins: u64,
     total_closed: u64,
-    streak: i32, // positive = consecutive wins, negative = consecutive losses
+    streak: i32,
+    at_max_positions: bool,
 }
 
 impl RiskChecker {
-    pub fn new(initial_equity: f64) -> Self {
+    pub fn new(_initial_equity: f64) -> Self {
         Self {
             daily_loss_usd: 0.0,
-            peak_equity: initial_equity,
-            current_equity: initial_equity,
+            peak_equity: 0.0,
+            current_equity: 0.0,
             open_positions: 0,
             total_wins: 0,
             total_closed: 0,
             streak: 0,
+            at_max_positions: false,
+        }
+    }
+
+    /// Sync equity from real exchange balance (called by balance poller).
+    pub fn sync_balance(&mut self, exchange_equity: f64) {
+        if exchange_equity > 0.0 {
+            self.current_equity = exchange_equity;
+            if exchange_equity > self.peak_equity {
+                self.peak_equity = exchange_equity;
+            }
+            // Initialize peak on first sync
+            if self.peak_equity <= 0.0 {
+                self.peak_equity = exchange_equity;
+            }
         }
     }
 
     /// Check if a new trade is allowed.
-    pub fn can_trade(&self, config: &Config) -> Result<(), String> {
+    pub fn can_trade(&mut self, config: &Config) -> Result<(), String> {
         if self.open_positions >= config.capital.max_concurrent_positions {
+            self.at_max_positions = true;
             return Err(format!(
                 "Max {} concurrent positions reached",
                 config.capital.max_concurrent_positions
             ));
         }
+        self.at_max_positions = false;
 
-        let daily_loss_pct = (self.daily_loss_usd / config.capital.initial_usd) * 100.0;
+        if self.current_equity <= 0.0 {
+            return Err("No balance available".to_string());
+        }
+
+        let daily_loss_pct = (self.daily_loss_usd / self.current_equity) * 100.0;
         if daily_loss_pct >= config.capital.max_daily_loss_pct {
             return Err(format!(
                 "Daily loss {:.1}% >= {:.1}% limit",
@@ -54,6 +77,10 @@ impl RiskChecker {
         }
 
         Ok(())
+    }
+
+    pub fn is_at_max_positions(&self) -> bool {
+        self.at_max_positions
     }
 
     /// Validate an LLM Execute decision against hard limits.
@@ -82,18 +109,9 @@ impl RiskChecker {
         Ok(())
     }
 
-    /// Max trade size in USD based on config.
+    /// Max trade size in USD based on real equity and config percentage.
     pub fn max_trade_usd(&self, config: &Config) -> f64 {
         self.current_equity * (config.capital.max_trade_pct / 100.0)
-    }
-
-    /// Update equity after a trade closes.
-    #[allow(dead_code)]
-    pub fn update_equity(&mut self, new_equity: f64) {
-        self.current_equity = new_equity;
-        if new_equity > self.peak_equity {
-            self.peak_equity = new_equity;
-        }
     }
 
     /// Record trade PnL for daily loss tracking + win/loss stats.
@@ -116,8 +134,11 @@ impl RiskChecker {
         }
     }
 
-    pub fn set_open_positions(&mut self, count: u32) {
+    pub fn set_open_positions(&mut self, count: u32, config: &Config) {
         self.open_positions = count;
+        if count < config.capital.max_concurrent_positions {
+            self.at_max_positions = false;
+        }
     }
 
     /// Check if kill switch should trigger based on drawdown.
@@ -135,9 +156,12 @@ impl RiskChecker {
     }
 
     #[allow(dead_code)]
-    pub fn daily_pnl_pct(&self, config: &Config) -> f64 {
-        let pnl = self.current_equity - config.capital.initial_usd;
-        (pnl / config.capital.initial_usd) * 100.0
+    pub fn daily_pnl_pct(&self) -> f64 {
+        if self.peak_equity > 0.0 {
+            ((self.current_equity - self.peak_equity) / self.peak_equity) * 100.0
+        } else {
+            0.0
+        }
     }
 
     pub fn win_rate(&self) -> f64 {
