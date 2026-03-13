@@ -163,24 +163,46 @@ impl HlExecutor {
         Ok(positions)
     }
 
-    /// Query account equity (total USDC value including margin + unrealized PnL).
-    #[allow(dead_code)]
+    /// Query total account equity: perp clearinghouse + spot USDC balance.
+    /// Unified accounts keep most USDC in the spot clearinghouse while using
+    /// it as perp collateral, so we must query both.
     pub async fn account_equity(&self) -> Result<f64> {
         let info = InfoClient::new(None, Some(BaseUrl::Mainnet))
             .await
             .map_err(|e| anyhow::anyhow!("Failed to create InfoClient: {e:?}"))?;
 
-        let state = info
-            .user_state(self.wallet.address())
-            .await
-            .map_err(|e| anyhow::anyhow!("Failed to query user state: {e:?}"))?;
+        // Perp clearinghouse: margin + unrealized PnL
+        // Unrealized PnL from perp positions
+        let unrealized_pnl = match info.user_state(self.wallet.address()).await {
+            Ok(state) => state
+                .asset_positions
+                .iter()
+                .map(|p| p.position.unrealized_pnl.parse::<f64>().unwrap_or(0.0))
+                .sum::<f64>(),
+            Err(e) => {
+                warn!("Failed to query perp state: {e:?}");
+                0.0
+            }
+        };
 
-        let equity: f64 = state
-            .margin_summary
-            .account_value
-            .parse()
-            .unwrap_or(0.0);
-        Ok(equity)
+        // Spot clearinghouse: USDC balance (unified accounts store all funds here,
+        // including margin allocated to perps — so don't add perp accountValue)
+        let spot_usdc = match info.user_token_balances(self.wallet.address()).await {
+            Ok(balances) => balances
+                .balances
+                .iter()
+                .find(|b| b.coin == "USDC")
+                .and_then(|b| b.total.parse::<f64>().ok())
+                .unwrap_or(0.0),
+            Err(e) => {
+                warn!("Failed to query spot balances: {e:?}");
+                0.0
+            }
+        };
+
+        let total = spot_usdc + unrealized_pnl;
+        info!(spot_usdc, unrealized_pnl, total, "HL account equity");
+        Ok(total)
     }
 
     /// Close all positions (market sell/buy to flatten).

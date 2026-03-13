@@ -172,10 +172,8 @@ async fn main() -> Result<()> {
 
     let mut second_look = SecondLookScheduler::new(config.execution.max_second_looks);
     let mut tuner = SignalTuner::new(&config);
-    let mut risk = RiskChecker::new(config.capital.initial_usd);
     let mut position_monitor = PositionMonitor::new();
     let mut kill_switch = KillSwitch::new();
-    let initial_usd = config.capital.initial_usd;
 
     let hl_executor = match HlExecutor::new(&secrets.hl_private_key).await {
         Ok(ex) => Some(ex),
@@ -186,7 +184,30 @@ async fn main() -> Result<()> {
     };
     let pm_executor = PmExecutor::new(&secrets.pm_api_key, &secrets.pm_api_secret, &secrets.pm_passphrase);
 
-    // Startup reconciliation: detect positions left open from previous run
+    // Fetch real exchange balance at startup for accurate daily PnL tracking.
+    // Falls back to config.capital.initial_usd if exchange queries fail.
+    let startup_hl_equity = if let Some(ref hl) = hl_executor {
+        hl.account_equity().await.unwrap_or(0.0)
+    } else {
+        0.0
+    };
+    let startup_pm_balance = pm_executor.account_balance().await.unwrap_or(0.0);
+    let initial_usd = {
+        let real = startup_hl_equity + startup_pm_balance;
+        if real > 0.0 {
+            info!(real_balance = real, "Using real exchange balance as starting equity");
+            real
+        } else {
+            warn!("Could not fetch exchange balance, falling back to config initial_usd");
+            config.capital.initial_usd
+        }
+    };
+    let mut risk = RiskChecker::new(initial_usd);
+
+    // Startup reconciliation: detect positions left open from previous run.
+    // Uses ATR-based TP/SL if available, otherwise defaults to 0.2%/0.3%.
+    let recovered_sl = aggregator.indicators.atr_pct(71000.0).unwrap_or(0.2).min(0.3);
+    let recovered_tp = (recovered_sl * 1.7).min(0.5);
     if let Some(ref hl) = hl_executor {
         match hl.positions().await {
             Ok(positions) => {
@@ -201,8 +222,8 @@ async fn main() -> Result<()> {
                         entry_price: pos.entry_px,
                         size_usd,
                         leverage: Some(pos.leverage),
-                        stop_loss_pct: 1.0,
-                        take_profit_pct: 1.0,
+                        stop_loss_pct: recovered_sl,
+                        take_profit_pct: recovered_tp,
                         opened_at: chrono::Utc::now(),
                         max_hold_secs: config.execution.max_trade_duration_secs,
                         pm_hedge: None,
@@ -263,7 +284,8 @@ async fn main() -> Result<()> {
                     continue;
                 }
 
-                let hl_eq = match http
+                // Query perp clearinghouse for unrealized PnL only
+                let unrealized_pnl = match http
                     .post("https://api.hyperliquid.xyz/info")
                     .json(&serde_json::json!({
                         "type": "clearinghouseState",
@@ -274,13 +296,50 @@ async fn main() -> Result<()> {
                 {
                     Ok(resp) => {
                         let body: serde_json::Value = resp.json().await.unwrap_or_default();
-                        body.pointer("/marginSummary/accountValue")
+                        // Sum unrealizedPnl from all positions
+                        body.get("assetPositions")
+                            .and_then(|v| v.as_array())
+                            .map(|positions| {
+                                positions.iter()
+                                    .filter_map(|p| {
+                                        p.pointer("/position/unrealizedPnl")
+                                            .and_then(|v| v.as_str())
+                                            .and_then(|s| s.parse::<f64>().ok())
+                                    })
+                                    .sum::<f64>()
+                            })
+                            .unwrap_or(0.0)
+                    }
+                    Err(_) => 0.0,
+                };
+
+                // Query spot clearinghouse for USDC balance (unified accounts
+                // store all funds here, including margin allocated to perps).
+                let spot_usdc = match http
+                    .post("https://api.hyperliquid.xyz/info")
+                    .json(&serde_json::json!({
+                        "type": "spotClearinghouseState",
+                        "user": &wallet_address
+                    }))
+                    .send()
+                    .await
+                {
+                    Ok(resp) => {
+                        let body: serde_json::Value = resp.json().await.unwrap_or_default();
+                        body.get("balances")
+                            .and_then(|b| b.as_array())
+                            .and_then(|arr| arr.iter().find(|e| e.get("coin").and_then(|c| c.as_str()) == Some("USDC")))
+                            .and_then(|e| e.get("total"))
                             .and_then(|v| v.as_str())
                             .and_then(|s| s.parse::<f64>().ok())
                             .unwrap_or(0.0)
                     }
                     Err(_) => 0.0,
                 };
+
+                // Unified account: spot USDC has all funds (incl. margin), add only unrealized PnL
+                let hl_eq = spot_usdc + unrealized_pnl;
+                tracing::debug!(spot_usdc, unrealized_pnl, hl_eq, "HL balance poll");
 
                 let pm_bal = pm.account_balance().await.unwrap_or(0.0);
                 let total = hl_eq + pm_bal;
@@ -322,13 +381,12 @@ async fn main() -> Result<()> {
                                                 _ => "unknown",
                                             };
                                             if let Some(trade) = position_monitor.remove_trade(&id) {
-                                                let leverage = trade.leverage.unwrap_or(1) as f64;
                                                 let pnl = match trade.direction {
-                                                    Direction::Long => (tick.price - trade.entry_price) / trade.entry_price * trade.size_usd * leverage,
-                                                    Direction::Short => (trade.entry_price - tick.price) / trade.entry_price * trade.size_usd * leverage,
+                                                    Direction::Long => (tick.price - trade.entry_price) / trade.entry_price * trade.size_usd,
+                                                    Direction::Short => (trade.entry_price - tick.price) / trade.entry_price * trade.size_usd,
                                                 };
                                                 risk.record_trade_pnl(pnl);
-                                                let pnl_pct = (risk.current_equity() - initial_usd) / initial_usd * 100.0;
+                                                let pnl_pct = if initial_usd > 0.0 { (risk.current_equity() - initial_usd) / initial_usd * 100.0 } else { 0.0 };
                                                 aggregator.update_daily_pnl(pnl_pct);
                                                 tuner.record_trade();
 
@@ -385,8 +443,8 @@ async fn main() -> Result<()> {
                                 // Send position updates to TUI
                                 let pos_infos: Vec<PositionInfo> = position_monitor.active_trades().iter().map(|t| {
                                     let pnl = match t.direction {
-                                        Direction::Long => (tick.price - t.entry_price) / t.entry_price * t.size_usd * t.leverage.unwrap_or(1) as f64,
-                                        Direction::Short => (t.entry_price - tick.price) / t.entry_price * t.size_usd * t.leverage.unwrap_or(1) as f64,
+                                        Direction::Long => (tick.price - t.entry_price) / t.entry_price * t.size_usd,
+                                        Direction::Short => (t.entry_price - tick.price) / t.entry_price * t.size_usd,
                                     };
                                     PositionInfo {
                                         id: t.id,
@@ -442,14 +500,13 @@ async fn main() -> Result<()> {
                                 let _ = hl.market_order("BTC", is_buy, sz, trade.leverage.unwrap_or(1)).await;
                             }
                             // Compute PnL for expired trade
-                            let leverage = trade.leverage.unwrap_or(1) as f64;
                             let pnl = match trade.direction {
-                                Direction::Long => (current_price - trade.entry_price) / trade.entry_price * trade.size_usd * leverage,
-                                Direction::Short => (trade.entry_price - current_price) / trade.entry_price * trade.size_usd * leverage,
+                                Direction::Long => (current_price - trade.entry_price) / trade.entry_price * trade.size_usd,
+                                Direction::Short => (trade.entry_price - current_price) / trade.entry_price * trade.size_usd,
                             };
                             risk.record_trade_pnl(pnl);
                             {
-                                let pnl_pct = (risk.current_equity() - initial_usd) / initial_usd * 100.0;
+                                let pnl_pct = if initial_usd > 0.0 { (risk.current_equity() - initial_usd) / initial_usd * 100.0 } else { 0.0 };
                                 aggregator.update_daily_pnl(pnl_pct);
                             }
 
@@ -644,7 +701,7 @@ async fn main() -> Result<()> {
     });
 
     // TUI on main thread
-    let mut app = App::new(config.capital.initial_usd);
+    let mut app = App::new(initial_usd);
 
     crossterm::terminal::enable_raw_mode()?;
     std::io::stdout().execute(crossterm::terminal::EnterAlternateScreen)?;
@@ -740,7 +797,10 @@ async fn handle_llm_decision(
             let mut entry_price = 0.0;
             if let Some(ref hl) = hl_executor {
                 let is_buy = *direction == Direction::Long;
-                let sz_coin = size_usd / snapshot.indicators.ema_9.unwrap_or(80000.0); // approximate
+                // size_usd is margin; notional = margin × leverage
+                // HL requires minimum $10 notional per order
+                let notional = (size_usd * leverage as f64).max(10.5);
+                let sz_coin = notional / snapshot.indicators.ema_9.unwrap_or(80000.0);
                 match hl.market_order("BTC", is_buy, sz_coin, leverage).await {
                     Ok(result) => {
                         if result.success {
@@ -777,14 +837,15 @@ async fn handle_llm_decision(
                 }
             }
 
-            // Track position
+            // Track position (size_usd = notional, consistent with recovered positions)
+            let notional_usd = size_usd * leverage as f64;
             let trade = ActiveTrade {
                 id: Uuid::new_v4(),
                 symbol: Symbol::BTC,
                 direction: *direction,
                 play_type: *play_type,
                 entry_price,
-                size_usd,
+                size_usd: notional_usd,
                 leverage: Some(leverage),
                 stop_loss_pct: *stop_loss_pct,
                 take_profit_pct: *take_profit_pct,

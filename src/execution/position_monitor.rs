@@ -87,13 +87,12 @@ impl PositionMonitor {
         self.active_trades
             .iter()
             .map(|t| {
-                let leverage = t.leverage.unwrap_or(1) as f64;
                 match t.direction {
                     crate::types::Direction::Long => {
-                        (current_price - t.entry_price) / t.entry_price * t.size_usd * leverage
+                        (current_price - t.entry_price) / t.entry_price * t.size_usd
                     }
                     crate::types::Direction::Short => {
-                        (t.entry_price - current_price) / t.entry_price * t.size_usd * leverage
+                        (t.entry_price - current_price) / t.entry_price * t.size_usd
                     }
                 }
             })

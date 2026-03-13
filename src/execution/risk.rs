@@ -10,6 +10,7 @@ const TRADE_COOLDOWN_SECS: i64 = 30;
 /// Uses real exchange balance (synced from balance poller) for all calculations.
 pub struct RiskChecker {
     daily_loss_usd: f64,
+    start_of_day_equity: f64,
     peak_equity: f64,
     current_equity: f64,
     open_positions: u32,
@@ -21,11 +22,12 @@ pub struct RiskChecker {
 }
 
 impl RiskChecker {
-    pub fn new(_initial_equity: f64) -> Self {
+    pub fn new(initial_equity: f64) -> Self {
         Self {
             daily_loss_usd: 0.0,
-            peak_equity: 0.0,
-            current_equity: 0.0,
+            start_of_day_equity: initial_equity,
+            peak_equity: if initial_equity > 0.0 { initial_equity } else { 0.0 },
+            current_equity: initial_equity,
             open_positions: 0,
             total_wins: 0,
             total_closed: 0,
@@ -42,9 +44,12 @@ impl RiskChecker {
             if exchange_equity > self.peak_equity {
                 self.peak_equity = exchange_equity;
             }
-            // Initialize peak on first sync
+            // Initialize peak and start-of-day on first sync
             if self.peak_equity <= 0.0 {
                 self.peak_equity = exchange_equity;
+            }
+            if self.start_of_day_equity <= 0.0 {
+                self.start_of_day_equity = exchange_equity;
             }
         }
     }
@@ -75,7 +80,8 @@ impl RiskChecker {
             return Err("No balance available".to_string());
         }
 
-        let daily_loss_pct = (self.daily_loss_usd / self.current_equity) * 100.0;
+        let base = if self.start_of_day_equity > 0.0 { self.start_of_day_equity } else { self.current_equity };
+        let daily_loss_pct = (self.daily_loss_usd / base) * 100.0;
         if daily_loss_pct >= config.capital.max_daily_loss_pct {
             return Err(format!(
                 "Daily loss {:.1}% >= {:.1}% limit",
@@ -175,6 +181,11 @@ impl RiskChecker {
 
     pub fn current_equity(&self) -> f64 {
         self.current_equity
+    }
+
+    #[allow(dead_code)]
+    pub fn start_of_day_equity(&self) -> f64 {
+        self.start_of_day_equity
     }
 
     #[allow(dead_code)]

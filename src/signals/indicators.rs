@@ -103,8 +103,11 @@ impl Indicators {
             return None;
         }
         let k = 2.0 / (period as f64 + 1.0);
-        let mut ema = candles[candles.len() - period].close;
-        for c in candles.iter().skip(candles.len() - period + 1) {
+        // Seed with SMA of the first `period` candles (matches TradingView)
+        let sma: f64 = candles.iter().take(period).map(|c| c.close).sum::<f64>() / period as f64;
+        let mut ema = sma;
+        // Apply exponential smoothing through all remaining candles
+        for c in candles.iter().skip(period) {
             ema = c.close * k + ema * (1.0 - k);
         }
         Some(ema)
@@ -123,11 +126,10 @@ impl Indicators {
             return None;
         }
 
-        let start = candles.len() - period - 1;
+        // Seed: SMA of first `period` gains/losses (Wilder method, matches TradingView)
         let mut avg_gain = 0.0;
         let mut avg_loss = 0.0;
-
-        for i in (start + 1)..=(start + period) {
+        for i in 1..=period {
             let change = candles[i].close - candles[i - 1].close;
             if change > 0.0 {
                 avg_gain += change;
@@ -137,6 +139,15 @@ impl Indicators {
         }
         avg_gain /= period as f64;
         avg_loss /= period as f64;
+
+        // Wilder smoothing through all remaining candles
+        for i in (period + 1)..candles.len() {
+            let change = candles[i].close - candles[i - 1].close;
+            let gain = if change > 0.0 { change } else { 0.0 };
+            let loss = if change < 0.0 { change.abs() } else { 0.0 };
+            avg_gain = (avg_gain * (period - 1) as f64 + gain) / period as f64;
+            avg_loss = (avg_loss * (period - 1) as f64 + loss) / period as f64;
+        }
 
         if avg_loss == 0.0 {
             return Some(100.0);
@@ -151,41 +162,54 @@ impl Indicators {
     // -----------------------------------------------------------------------
 
     pub fn stoch_rsi(&self) -> Option<f64> {
-        let period = 14;
+        let rsi_period: usize = 14;
+        let stoch_period: usize = 14;
         let candles = &self.candles_1m;
-        if candles.len() < period + period {
+        let n = candles.len();
+        if n < rsi_period + stoch_period + 1 {
             return None;
         }
 
-        // Compute RSI values for the last `period` candles
-        let mut rsi_values = Vec::new();
-        for end in (candles.len() - period)..candles.len() {
-            // Build a sub-slice ending at `end+1`
-            let sub_len = end + 1;
-            if sub_len < period + 1 {
-                continue;
-            }
-            let mut ag = 0.0;
-            let mut al = 0.0;
-            for i in (sub_len - period)..sub_len {
+        // Compute RSI at each candle endpoint using Wilder smoothing.
+        // Seed the first RSI with SMA of gains/losses over the first rsi_period changes.
+        let mut avg_gain;
+        let mut avg_loss;
+        {
+            let mut g = 0.0;
+            let mut l = 0.0;
+            for i in 1..=rsi_period {
                 let change = candles[i].close - candles[i - 1].close;
-                if change > 0.0 {
-                    ag += change;
-                } else {
-                    al += change.abs();
-                }
+                if change > 0.0 { g += change; } else { l += change.abs(); }
             }
-            ag /= period as f64;
-            al /= period as f64;
-            let rsi = if al == 0.0 {
-                100.0
-            } else {
-                100.0 - (100.0 / (1.0 + ag / al))
-            };
+            avg_gain = g / rsi_period as f64;
+            avg_loss = l / rsi_period as f64;
+        }
+
+        // Continue with exponential smoothing for the remaining candles,
+        // collecting the last stoch_period RSI values.
+        let collect_from = n - stoch_period;
+        let mut rsi_values = Vec::with_capacity(stoch_period);
+
+        // First RSI value is at index rsi_period
+        if rsi_period >= collect_from {
+            let rsi = if avg_loss == 0.0 { 100.0 } else { 100.0 - (100.0 / (1.0 + avg_gain / avg_loss)) };
             rsi_values.push(rsi);
         }
 
-        if rsi_values.is_empty() {
+        for i in (rsi_period + 1)..n {
+            let change = candles[i].close - candles[i - 1].close;
+            let gain = if change > 0.0 { change } else { 0.0 };
+            let loss = if change < 0.0 { change.abs() } else { 0.0 };
+            avg_gain = (avg_gain * (rsi_period - 1) as f64 + gain) / rsi_period as f64;
+            avg_loss = (avg_loss * (rsi_period - 1) as f64 + loss) / rsi_period as f64;
+
+            if i >= collect_from {
+                let rsi = if avg_loss == 0.0 { 100.0 } else { 100.0 - (100.0 / (1.0 + avg_gain / avg_loss)) };
+                rsi_values.push(rsi);
+            }
+        }
+
+        if rsi_values.len() < stoch_period {
             return None;
         }
 
@@ -193,7 +217,8 @@ impl Indicators {
         let max_rsi = rsi_values.iter().cloned().fold(f64::MIN, f64::max);
         let current_rsi = *rsi_values.last()?;
 
-        if (max_rsi - min_rsi).abs() < f64::EPSILON {
+        // When RSI barely moved, return neutral instead of extreme 0/100
+        if (max_rsi - min_rsi).abs() < 0.5 {
             return Some(50.0);
         }
 
@@ -266,18 +291,26 @@ impl Indicators {
             return None;
         }
 
-        let start = candles.len() - period;
-        let mut atr_sum = 0.0;
+        // Seed: SMA of first `period` true ranges (Wilder method, matches TradingView)
+        let mut atr = 0.0;
+        for i in 1..=period {
+            let high_low = candles[i].high - candles[i].low;
+            let high_close = (candles[i].high - candles[i - 1].close).abs();
+            let low_close = (candles[i].low - candles[i - 1].close).abs();
+            atr += high_low.max(high_close).max(low_close);
+        }
+        atr /= period as f64;
 
-        for i in start..candles.len() {
+        // Wilder smoothing through all remaining candles
+        for i in (period + 1)..candles.len() {
             let high_low = candles[i].high - candles[i].low;
             let high_close = (candles[i].high - candles[i - 1].close).abs();
             let low_close = (candles[i].low - candles[i - 1].close).abs();
             let tr = high_low.max(high_close).max(low_close);
-            atr_sum += tr;
+            atr = (atr * (period - 1) as f64 + tr) / period as f64;
         }
 
-        Some(atr_sum / period as f64)
+        Some(atr)
     }
 
     /// ATR as percentage of current price.
