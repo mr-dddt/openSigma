@@ -186,6 +186,46 @@ async fn main() -> Result<()> {
     };
     let pm_executor = PmExecutor::new(&secrets.pm_api_key, &secrets.pm_api_secret, &secrets.pm_passphrase);
 
+    // Startup reconciliation: detect positions left open from previous run
+    if let Some(ref hl) = hl_executor {
+        match hl.positions().await {
+            Ok(positions) => {
+                for pos in &positions {
+                    let direction = if pos.size > 0.0 { Direction::Long } else { Direction::Short };
+                    let size_usd = pos.size.abs() * pos.entry_px;
+                    let trade = ActiveTrade {
+                        id: Uuid::new_v4(),
+                        symbol: Symbol::BTC,
+                        direction,
+                        play_type: PlayType::PurePerpScalp,
+                        entry_price: pos.entry_px,
+                        size_usd,
+                        leverage: Some(pos.leverage),
+                        stop_loss_pct: 1.0,
+                        take_profit_pct: 1.0,
+                        opened_at: chrono::Utc::now(),
+                        max_hold_secs: config.execution.max_trade_duration_secs,
+                        pm_hedge: None,
+                        llm_reasoning: "Recovered from previous session".to_string(),
+                        signal_level: SignalLevel::Weak,
+                        signal_score: 0,
+                    };
+                    info!(
+                        coin = %pos.coin, direction = %direction,
+                        size = pos.size, entry = pos.entry_px,
+                        "Recovered open position from HL"
+                    );
+                    position_monitor.add_trade(trade);
+                }
+                if !positions.is_empty() {
+                    risk.set_open_positions(position_monitor.open_count(), &config);
+                    info!(count = positions.len(), "Startup reconciliation complete");
+                }
+            }
+            Err(e) => warn!("Failed to query HL positions on startup: {e:#}"),
+        }
+    }
+
     let eval_interval =
         tokio::time::Duration::from_secs(config.execution.signal_eval_interval_secs);
     let mut eval_ticker = tokio::time::interval(eval_interval);
@@ -759,6 +799,7 @@ async fn handle_llm_decision(
             let trade_opened_at = trade.opened_at;
             position_monitor.add_trade(trade);
             risk.set_open_positions(position_monitor.open_count(), config);
+            risk.record_trade_open();
 
             // Journal the open trade
             let open_record = TradeRecord {

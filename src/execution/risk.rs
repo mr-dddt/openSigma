@@ -1,6 +1,10 @@
+use chrono::{DateTime, Utc};
+
 use crate::config::Config;
 use crate::types::LlmDecision;
 use tracing::warn;
+
+const TRADE_COOLDOWN_SECS: i64 = 30;
 
 /// Hard risk checks that the LLM cannot override.
 /// Uses real exchange balance (synced from balance poller) for all calculations.
@@ -13,6 +17,7 @@ pub struct RiskChecker {
     total_closed: u64,
     streak: i32,
     at_max_positions: bool,
+    last_trade_at: Option<DateTime<Utc>>,
 }
 
 impl RiskChecker {
@@ -26,6 +31,7 @@ impl RiskChecker {
             total_closed: 0,
             streak: 0,
             at_max_positions: false,
+            last_trade_at: None,
         }
     }
 
@@ -54,6 +60,17 @@ impl RiskChecker {
         }
         self.at_max_positions = false;
 
+        // Cooldown: wait at least TRADE_COOLDOWN_SECS between entries
+        if let Some(last) = self.last_trade_at {
+            let elapsed = (Utc::now() - last).num_seconds();
+            if elapsed < TRADE_COOLDOWN_SECS {
+                return Err(format!(
+                    "Cooldown: {}s remaining",
+                    TRADE_COOLDOWN_SECS - elapsed
+                ));
+            }
+        }
+
         if self.current_equity <= 0.0 {
             return Err("No balance available".to_string());
         }
@@ -81,6 +98,11 @@ impl RiskChecker {
 
     pub fn is_at_max_positions(&self) -> bool {
         self.at_max_positions
+    }
+
+    /// Record that a trade was just opened (starts cooldown timer).
+    pub fn record_trade_open(&mut self) {
+        self.last_trade_at = Some(Utc::now());
     }
 
     /// Validate an LLM Execute decision against hard limits.
