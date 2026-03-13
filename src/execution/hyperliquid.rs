@@ -164,6 +164,7 @@ impl HlExecutor {
     }
 
     /// Query account equity (total USDC value including margin + unrealized PnL).
+    #[allow(dead_code)]
     pub async fn account_equity(&self) -> Result<f64> {
         let info = InfoClient::new(None, Some(BaseUrl::Mainnet))
             .await

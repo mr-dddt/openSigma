@@ -25,6 +25,7 @@ use crate::data::hyperliquid::{self, HyperliquidFeed};
 use crate::data::news::NewsFeed;
 use crate::data::polymarket::PolymarketFeed;
 use crate::execution::hyperliquid::HlExecutor;
+use ethers::signers::Signer as _;
 use crate::execution::kill_switch::KillSwitch;
 use crate::execution::polymarket::PmExecutor;
 use crate::execution::position_monitor::{PositionEvent, PositionMonitor};
@@ -195,6 +196,7 @@ async fn main() -> Result<()> {
     let config_for_engine = shared_config.clone();
 
     // Spawn balance poller (queries HL + PM every 30s)
+    // Uses lightweight REST calls — no SDK re-init needed.
     {
         let tui_tx_bal = tui_tx.clone();
         let hl_key = secrets.hl_private_key.clone();
@@ -203,13 +205,41 @@ async fn main() -> Result<()> {
         let pm_passphrase = secrets.pm_passphrase.clone();
         tokio::spawn(async move {
             let mut interval = tokio::time::interval(tokio::time::Duration::from_secs(30));
+            let http = reqwest::Client::new();
             let pm = PmExecutor::new(&pm_api_key, &pm_api_secret, &pm_passphrase);
+
+            // Derive wallet address from private key once
+            let wallet_address = match hl_key.parse::<ethers::signers::LocalWallet>() {
+                Ok(w) => format!("{:?}", w.address()),
+                Err(_) => String::new(),
+            };
+
             loop {
                 interval.tick().await;
-                let hl_eq = match HlExecutor::new(&hl_key).await {
-                    Ok(hl) => hl.account_equity().await.unwrap_or(0.0),
+                if wallet_address.is_empty() {
+                    continue;
+                }
+
+                // Query HL balance via lightweight REST (no SDK needed)
+                let hl_eq = match http
+                    .post("https://api.hyperliquid.xyz/info")
+                    .json(&serde_json::json!({
+                        "type": "clearinghouseState",
+                        "user": &wallet_address
+                    }))
+                    .send()
+                    .await
+                {
+                    Ok(resp) => {
+                        let body: serde_json::Value = resp.json().await.unwrap_or_default();
+                        body.pointer("/marginSummary/accountValue")
+                            .and_then(|v| v.as_str())
+                            .and_then(|s| s.parse::<f64>().ok())
+                            .unwrap_or(0.0)
+                    }
                     Err(_) => 0.0,
                 };
+
                 let pm_bal = pm.account_balance().await.unwrap_or(0.0);
                 let _ = tui_tx_bal.send(TuiUpdate::Balances(ExchangeBalances {
                     hl_equity: hl_eq,
