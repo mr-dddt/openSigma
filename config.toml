@@ -36,7 +36,7 @@ size_mult = 0.6
 
 [llm]
 model = "claude-sonnet-4-20250514"
-timeout_ms = 3000
+timeout_ms = 8000
 
 [signals]
 strong_threshold = 5
