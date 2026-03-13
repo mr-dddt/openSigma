@@ -57,5 +57,5 @@ tune_every_n_trades = 20
 inactivity_timeout_secs = 600
 
 [telegram]
-enabled = false
+enabled = true
 # Set TELEGRAM_BOT_TOKEN and TELEGRAM_CHAT_ID in .env
