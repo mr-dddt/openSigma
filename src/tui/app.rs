@@ -105,13 +105,14 @@ impl App {
     }
 
     pub fn render_frame(&self, frame: &mut Frame) {
+        let pos_height = (self.positions.len() as u16 + 2).max(4).min(14);
         let chunks = Layout::default()
             .direction(ratatui::layout::Direction::Vertical)
             .constraints([
-                Constraint::Length(7),  // top: status + signal
-                Constraint::Length(8),  // positions (expanded)
-                Constraint::Min(6),    // log
-                Constraint::Length(3), // footer: stats + keys
+                Constraint::Length(7),         // top: status + signal
+                Constraint::Length(pos_height), // positions: grows with count
+                Constraint::Min(6),            // log
+                Constraint::Length(3),          // footer: stats + keys
             ])
             .split(frame.area());
 
