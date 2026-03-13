@@ -159,12 +159,37 @@ impl SignalAggregator {
             }
         }
 
-        // --- Bollinger Bands ---
+        // --- Bollinger Bands (smart scoring, not a hard filter) ---
         if let Some((upper, _sma, lower)) = self.indicators.bollinger_bands() {
             indicators.bb_upper = Some(upper);
             indicators.bb_lower = Some(lower);
         }
         indicators.bb_squeeze = self.indicators.bb_squeeze();
+        indicators.bb_bandwidth = self.indicators.bb_bandwidth();
+        let bb_pos = self.indicators.bb_position(self.latest_price);
+        indicators.bb_position = bb_pos;
+
+        if let Some(pos) = bb_pos {
+            if indicators.bb_squeeze {
+                // During squeeze: mean-reversion scoring.
+                // Price near lower band → expect bounce (bull).
+                // Price near upper band → expect rejection (bear).
+                if pos <= -0.8 {
+                    bull += 1;
+                } else if pos >= 0.8 {
+                    bear += 1;
+                }
+            } else {
+                // Bands expanding (post-squeeze or trending): breakout scoring.
+                // Price broke above upper band → momentum long.
+                // Price broke below lower band → momentum short.
+                if pos > 1.0 {
+                    bull += 1;
+                } else if pos < -1.0 {
+                    bear += 1;
+                }
+            }
+        }
 
         // --- ATR ---
         indicators.atr_14 = self.indicators.atr_14();
@@ -201,10 +226,8 @@ impl SignalAggregator {
     }
 
     fn check_hard_filters(&self, config: &Config, net_score: i32) -> Option<String> {
-        // BB squeeze → breakout imminent, direction unknown
-        if self.indicators.bb_squeeze() {
-            return Some("BB squeeze active".into());
-        }
+        // BB squeeze is no longer a hard filter — it's handled as a scoring
+        // signal above (mean-reversion near bands, breakout on band break).
 
         // ATR too low → dead market
         if let Some(atr_pct) = self.indicators.atr_pct(self.latest_price) {

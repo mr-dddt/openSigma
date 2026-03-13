@@ -46,11 +46,35 @@ impl LlmGate {
         let ind = &snapshot.indicators;
         let (in_session, size_mult) = config.active_session();
 
+        let bb_state = if ind.bb_squeeze {
+            format!(
+                "SQUEEZE (bw={:.3}%, pos={:+.2}) — price {} of bands",
+                ind.bb_bandwidth.unwrap_or(0.0) * 100.0,
+                ind.bb_position.unwrap_or(0.0),
+                match ind.bb_position {
+                    Some(p) if p <= -0.7 => "near LOWER (mean-reversion long candidate)",
+                    Some(p) if p >= 0.7 => "near UPPER (mean-reversion short candidate)",
+                    _ => "mid-range",
+                },
+            )
+        } else {
+            format!(
+                "normal (bw={:.3}%, pos={:+.2}){}",
+                ind.bb_bandwidth.unwrap_or(0.0) * 100.0,
+                ind.bb_position.unwrap_or(0.0),
+                match ind.bb_position {
+                    Some(p) if p > 1.0 => " — BREAKOUT ABOVE upper band",
+                    Some(p) if p < -1.0 => " — BREAKOUT BELOW lower band",
+                    _ => "",
+                },
+            )
+        };
+
         format!(
             "Signal: {} (net_score={}, bull={}, bear={})\n\
              EMA9={:.1} EMA21={:.1} RSI={:.1} StochRSI={:.1}\n\
              CVD={:.2} OB_Imbalance={:.2} ATR%={:.3}\n\
-             BB_squeeze={} PM_div={}\n\
+             BB: {} PM_div={}\n\
              Session: {} (size_mult={:.1})\n\
              Config: max_trade_pct={:.1}, max_leverage={}, max_duration={}s\n\
              \nMemory:\n{}",
@@ -65,7 +89,7 @@ impl LlmGate {
             ind.cvd.unwrap_or(0.0),
             ind.ob_imbalance.unwrap_or(1.0),
             ind.atr_pct.unwrap_or(0.0),
-            ind.bb_squeeze,
+            bb_state,
             ind.pm_divergence.map_or("none".to_string(), |v| format!("{:.2}", v)),
             if in_session { "active" } else { "inactive" },
             size_mult,

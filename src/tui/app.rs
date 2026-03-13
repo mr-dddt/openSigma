@@ -175,11 +175,11 @@ impl App {
                     Span::raw(format!(" {:.2}", ind.ob_imbalance.unwrap_or(1.0))),
                     Span::styled("  ATR%:", Style::default().fg(Color::Cyan)),
                     Span::raw(format!(" {:.3}", ind.atr_pct.unwrap_or(0.0))),
-                    if ind.bb_squeeze {
-                        Span::styled("  BB:SQUEEZE", Style::default().fg(Color::Yellow))
-                    } else {
-                        Span::raw("")
-                    },
+                    Span::styled("  BB:", Style::default().fg(Color::Cyan)),
+                    Span::styled(
+                        format!(" {}", bb_label(ind.bb_squeeze, ind.bb_position.unwrap_or(0.0))),
+                        Style::default().fg(bb_color(ind.bb_squeeze, ind.bb_position.unwrap_or(0.0))),
+                    ),
                 ]),
                 Line::from(vec![
                     Span::styled(" Filter: ", Style::default().fg(Color::DarkGray)),
@@ -308,5 +308,31 @@ fn signal_level_color(level: SignalLevel) -> Color {
         SignalLevel::LeanShort => Color::Yellow,
         SignalLevel::StrongShort => Color::Magenta,
         SignalLevel::NoTrade => Color::DarkGray,
+    }
+}
+
+fn bb_label(squeeze: bool, pos: f64) -> String {
+    if squeeze {
+        if pos <= -0.7 { "SQ↓".into() }
+        else if pos >= 0.7 { "SQ↑".into() }
+        else { "SQ".into() }
+    } else if pos > 1.0 {
+        "BRK↑".into()
+    } else if pos < -1.0 {
+        "BRK↓".into()
+    } else {
+        format!("{:+.1}", pos)
+    }
+}
+
+fn bb_color(squeeze: bool, pos: f64) -> Color {
+    if squeeze {
+        if pos <= -0.7 { Color::Green }
+        else if pos >= 0.7 { Color::Red }
+        else { Color::Yellow }
+    } else if pos.abs() > 1.0 {
+        Color::Magenta
+    } else {
+        Color::DarkGray
     }
 }

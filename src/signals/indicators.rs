@@ -67,6 +67,25 @@ impl Indicators {
         }
     }
 
+    /// Seed CVD from historical candles using close-vs-open as buy/sell proxy.
+    /// Not as accurate as real trade-level data, but gives a directional
+    /// starting point instead of 0.0 on startup.
+    pub fn seed_cvd_from_candles(&mut self, candles: &[Candle]) {
+        let recent: Vec<&Candle> = candles.iter().rev().take(5).collect();
+        let mut buys = 0.0f64;
+        let mut sells = 0.0f64;
+        for c in recent {
+            if c.close >= c.open {
+                buys += c.volume;
+            } else {
+                sells += c.volume;
+            }
+        }
+        self.cvd_buys = buys;
+        self.cvd_sells = sells;
+        self.cvd_reset_at = Some(chrono::Utc::now() + chrono::Duration::minutes(5));
+    }
+
     // -----------------------------------------------------------------------
     // EMA (Exponential Moving Average)
     // -----------------------------------------------------------------------
@@ -208,15 +227,32 @@ impl Indicators {
         Some((upper, sma, lower))
     }
 
-    /// BB squeeze: bandwidth < 4% of SMA (tight range, breakout imminent).
+    /// BB squeeze: bandwidth < 1% of SMA (genuinely tight consolidation).
+    /// 4% was too aggressive — blocked trades during normal BTC ranges.
     pub fn bb_squeeze(&self) -> bool {
-        if let Some((upper, sma, lower)) = self.bollinger_bands() {
-            if sma > 0.0 {
-                let bandwidth = (upper - lower) / sma;
-                return bandwidth < 0.04;
-            }
+        self.bb_bandwidth().map_or(false, |bw| bw < 0.01)
+    }
+
+    /// BB bandwidth as fraction of SMA (0.0 = zero width, typical 0.01–0.06).
+    pub fn bb_bandwidth(&self) -> Option<f64> {
+        let (upper, sma, lower) = self.bollinger_bands()?;
+        if sma > 0.0 {
+            Some((upper - lower) / sma)
+        } else {
+            None
         }
-        false
+    }
+
+    /// Where is price relative to the bands? Returns -1.0 (at lower) to +1.0 (at upper).
+    /// 0.0 = at SMA. Values outside [-1, 1] mean price broke through a band.
+    pub fn bb_position(&self, current_price: f64) -> Option<f64> {
+        let (upper, sma, lower) = self.bollinger_bands()?;
+        let half_width = (upper - lower) / 2.0;
+        if half_width > 0.0 {
+            Some((current_price - sma) / half_width)
+        } else {
+            None
+        }
     }
 
     // -----------------------------------------------------------------------

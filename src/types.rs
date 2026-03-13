@@ -185,6 +185,10 @@ pub struct IndicatorValues {
     pub bb_upper: Option<f64>,
     pub bb_lower: Option<f64>,
     pub bb_squeeze: bool,
+    /// Price position within BB: -1.0 = lower band, 0.0 = SMA, +1.0 = upper band.
+    /// Values outside [-1, 1] = price broke through a band.
+    pub bb_position: Option<f64>,
+    pub bb_bandwidth: Option<f64>,
     pub atr_14: Option<f64>,
     pub atr_pct: Option<f64>,
     pub cvd: Option<f64>,

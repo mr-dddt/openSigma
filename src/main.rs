@@ -132,10 +132,11 @@ async fn main() -> Result<()> {
     match hyperliquid::fetch_historical_candles("BTC", "5m", 200).await {
         Ok(candles) => {
             let count = candles.len();
+            aggregator.indicators.seed_cvd_from_candles(&candles);
             for c in candles {
                 aggregator.indicators.push_candle_5m(c);
             }
-            info!(count, "5m candles loaded — RSI, ATR, BB ready");
+            info!(count, "5m candles loaded — RSI, ATR, BB, CVD ready");
         }
         Err(e) => warn!("Failed to load 5m candles (will warm up from live): {e:#}"),
     }
