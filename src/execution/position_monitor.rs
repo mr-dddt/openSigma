@@ -9,6 +9,7 @@ pub struct PositionMonitor {
     pub active_trades: Vec<ActiveTrade>,
 }
 
+#[allow(dead_code)]
 pub enum PositionEvent {
     Expired(Uuid),
     StopHit(Uuid),
@@ -76,7 +77,12 @@ impl PositionMonitor {
         self.active_trades.len() as u32
     }
 
+    pub fn active_trades(&self) -> &[ActiveTrade] {
+        &self.active_trades
+    }
+
     /// Calculate total unrealized PnL.
+    #[allow(dead_code)]
     pub fn unrealized_pnl(&self, current_price: f64) -> f64 {
         self.active_trades
             .iter()

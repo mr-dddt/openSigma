@@ -263,6 +263,7 @@ impl Indicators {
     }
 
     /// CVD direction: positive = net buying, negative = net selling.
+    #[allow(dead_code)]
     pub fn cvd_rising(&self) -> bool {
         self.cvd() > 0.0
     }

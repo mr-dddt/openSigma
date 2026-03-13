@@ -2,10 +2,12 @@ use crate::types::*;
 
 /// Polymarket odds analyzer — detects divergence and spread opportunities.
 /// Phase 1: basic divergence detection. Phase 2: full arbitrage logic.
+#[allow(dead_code)] // Phase 2 stub — will be wired when PM SDK is integrated
 pub struct PmAnalyzer {
     latest_odds: Option<PmOdds>,
 }
 
+#[allow(dead_code)]
 impl PmAnalyzer {
     pub fn new() -> Self {
         Self { latest_odds: None }

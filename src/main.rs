@@ -4,6 +4,7 @@ mod data;
 mod execution;
 mod journal;
 mod signals;
+mod telegram;
 mod tui;
 mod types;
 
@@ -18,7 +19,7 @@ use uuid::Uuid;
 use crate::agent::llm_client::LlmClient;
 use crate::agent::llm_gate::LlmGate;
 use crate::agent::second_look::SecondLookScheduler;
-use crate::agent::tuner::SignalTuner;
+use crate::agent::tuner::{SignalTuner, TuneTrigger};
 use crate::config::{Config, Secrets};
 use crate::data::hyperliquid::HyperliquidFeed;
 use crate::data::news::NewsFeed;
@@ -30,9 +31,11 @@ use crate::execution::position_monitor::{PositionEvent, PositionMonitor};
 use crate::execution::risk::RiskChecker;
 use crate::journal::logger::TradeLogger;
 use crate::journal::memory::MemoryManager;
+use crate::journal::reporter::Reporter;
 use crate::signals::aggregator::SignalAggregator;
 use crate::signals::indicators::Indicators;
-use crate::tui::app::App;
+use crate::telegram::TelegramClient;
+use crate::tui::app::{App, PerformanceStats, PositionInfo};
 use crate::types::*;
 
 const TUNE_SYSTEM_PROMPT: &str = r#"You are openSigma's signal engine tuner. Analyze the recent trade history and current signal parameters, then suggest parameter adjustments to improve performance.
@@ -62,12 +65,15 @@ enum TuiUpdate {
     Price(f64),
     Signal(SignalSnapshot),
     Log(String),
+    Positions(Vec<PositionInfo>),
+    Stats(PerformanceStats),
 }
 
 #[tokio::main]
 async fn main() -> Result<()> {
     // Log to file to avoid interfering with TUI rendering
     std::fs::create_dir_all("data").ok();
+    std::fs::create_dir_all("data/reports").ok();
     let log_file = std::fs::File::create("data/opensigma.log")?;
     tracing_subscriber::fmt()
         .with_env_filter(
@@ -108,7 +114,7 @@ async fn main() -> Result<()> {
 
     // Initialize components
     let mut aggregator = SignalAggregator::new();
-    let memory = MemoryManager::new("memory/memory.md");
+    let memory = Arc::new(MemoryManager::new("memory/memory.md"));
     let journal = TradeLogger::new("data/journal.jsonl");
 
     let llm_client = LlmClient::new(
@@ -116,7 +122,7 @@ async fn main() -> Result<()> {
         config.llm.model.clone(),
         config.llm.timeout_ms,
     );
-    let llm_gate = LlmGate::new(llm_client, memory);
+    let llm_gate = LlmGate::new(llm_client, memory.clone());
 
     // Separate LLM client for tuning (avoids borrow conflicts)
     let tune_client = LlmClient::new(
@@ -125,20 +131,31 @@ async fn main() -> Result<()> {
         config.llm.timeout_ms * 3, // longer timeout for tuning
     );
 
+    // Reporter for 20-trade batch analysis
+    let reporter = Reporter::new(&secrets.anthropic_api_key, &config.llm.model);
+
+    // Telegram alerts (optional)
+    let telegram = if config.telegram.enabled {
+        TelegramClient::new(secrets.telegram_bot_token.clone(), secrets.telegram_chat_id.clone())
+    } else {
+        None
+    };
+
     let mut second_look = SecondLookScheduler::new(config.execution.max_second_looks);
     let mut tuner = SignalTuner::new(&config);
     let mut risk = RiskChecker::new(config.capital.initial_usd);
     let mut position_monitor = PositionMonitor::new();
     let mut kill_switch = KillSwitch::new();
+    let initial_usd = config.capital.initial_usd;
 
-    let hl_executor = match HlExecutor::new(&secrets.hl_private_key) {
+    let hl_executor = match HlExecutor::new(&secrets.hl_private_key).await {
         Ok(ex) => Some(ex),
         Err(e) => {
             warn!("HlExecutor init failed (trading disabled): {e:#}");
             None
         }
     };
-    let pm_executor = PmExecutor::new(&secrets.pm_private_key);
+    let pm_executor = PmExecutor::new(&secrets.pm_api_key, &secrets.pm_api_secret, &secrets.pm_passphrase);
 
     let eval_interval =
         tokio::time::Duration::from_secs(config.execution.signal_eval_interval_secs);
@@ -161,6 +178,10 @@ async fn main() -> Result<()> {
                                 let _ = tui_tx_clone.send(TuiUpdate::Price(tick.price)).await;
 
                                 // Check position price levels
+                                // Software-side stop/TP monitoring. HL also has trigger orders
+                                // for the same levels. remove_trade() guards against double-processing.
+                                // TODO: after SDK integration, subscribe to HL order fills to detect
+                                // exchange-side closes and cancel redundant trigger orders.
                                 let events = position_monitor.check_price_levels(tick.price);
                                 for pe in events {
                                     match pe {
@@ -171,8 +192,14 @@ async fn main() -> Result<()> {
                                                 _ => "unknown",
                                             };
                                             if let Some(trade) = position_monitor.remove_trade(&id) {
-                                                let pnl = position_monitor.unrealized_pnl(tick.price);
+                                                let leverage = trade.leverage.unwrap_or(1) as f64;
+                                                let pnl = match trade.direction {
+                                                    Direction::Long => (tick.price - trade.entry_price) / trade.entry_price * trade.size_usd * leverage,
+                                                    Direction::Short => (trade.entry_price - tick.price) / trade.entry_price * trade.size_usd * leverage,
+                                                };
                                                 risk.record_trade_pnl(pnl);
+                                                let pnl_pct = (risk.current_equity() - initial_usd) / initial_usd * 100.0;
+                                                aggregator.update_daily_pnl(pnl_pct);
                                                 tuner.record_trade();
 
                                                 let record = TradeRecord {
@@ -195,17 +222,51 @@ async fn main() -> Result<()> {
                                                 };
                                                 let _ = journal.log_entry(&record);
 
+                                                // Telegram alert on trade close
+                                                if let Some(ref tg) = telegram {
+                                                    let r = record.clone();
+                                                    let tg_ref = tg.clone();
+                                                    tokio::spawn(async move { tg_ref.send_trade_close(&r).await });
+                                                }
+
                                                 let _ = tui_tx_clone.send(TuiUpdate::Log(format!(
                                                     "[{}] {} closed ({}) PnL: ${:.2}",
                                                     chrono::Utc::now().format("%H:%M:%S"),
                                                     trade.direction, reason, pnl,
                                                 ))).await;
+
+                                                // Send updated stats
+                                                let _ = tui_tx_clone.send(TuiUpdate::Stats(PerformanceStats {
+                                                    total_trades: risk.total_closed(),
+                                                    win_rate: risk.win_rate(),
+                                                    total_pnl: risk.current_equity() - initial_usd,
+                                                    streak: risk.streak(),
+                                                })).await;
                                             }
                                         }
                                         _ => {}
                                     }
                                 }
                                 risk.set_open_positions(position_monitor.open_count());
+
+                                // Send position updates to TUI
+                                let pos_infos: Vec<PositionInfo> = position_monitor.active_trades().iter().map(|t| {
+                                    let pnl = match t.direction {
+                                        Direction::Long => (tick.price - t.entry_price) / t.entry_price * t.size_usd * t.leverage.unwrap_or(1) as f64,
+                                        Direction::Short => (t.entry_price - tick.price) / t.entry_price * t.size_usd * t.leverage.unwrap_or(1) as f64,
+                                    };
+                                    PositionInfo {
+                                        id: t.id,
+                                        direction: t.direction,
+                                        play_type: t.play_type,
+                                        entry_price: t.entry_price,
+                                        size_usd: t.size_usd,
+                                        leverage: t.leverage.unwrap_or(1),
+                                        unrealized_pnl: pnl,
+                                        duration_secs: (chrono::Utc::now() - t.opened_at).num_seconds().max(0) as u64,
+                                    }
+                                }).collect();
+                                let _ = tui_tx_clone.send(TuiUpdate::Positions(pos_infos)).await;
                             }
                         }
                         MarketEvent::Trade(trade) => {
@@ -241,15 +302,48 @@ async fn main() -> Result<()> {
                         if let Some(trade) = position_monitor.remove_trade(&id) {
                             info!(id = %trade.id, "Position expired (max hold time)");
                             // Close via executor if available
+                            let current_price = aggregator.latest_price();
                             if let Some(ref hl) = hl_executor {
                                 let is_buy = trade.direction == Direction::Short;
                                 let sz = trade.size_usd / trade.entry_price;
                                 let _ = hl.market_order("BTC", is_buy, sz, trade.leverage.unwrap_or(1)).await;
                             }
+                            // Compute PnL for expired trade
+                            let leverage = trade.leverage.unwrap_or(1) as f64;
+                            let pnl = match trade.direction {
+                                Direction::Long => (current_price - trade.entry_price) / trade.entry_price * trade.size_usd * leverage,
+                                Direction::Short => (trade.entry_price - current_price) / trade.entry_price * trade.size_usd * leverage,
+                            };
+                            risk.record_trade_pnl(pnl);
+                            {
+                                let pnl_pct = (risk.current_equity() - initial_usd) / initial_usd * 100.0;
+                                aggregator.update_daily_pnl(pnl_pct);
+                            }
+
+                            let record = TradeRecord {
+                                id: trade.id,
+                                ts_open: trade.opened_at,
+                                ts_close: Some(chrono::Utc::now()),
+                                duration_secs: Some((chrono::Utc::now() - trade.opened_at).num_seconds() as u64),
+                                play_type: trade.play_type,
+                                direction: trade.direction,
+                                signal_level: trade.signal_level,
+                                signal_score: trade.signal_score,
+                                entry_price: trade.entry_price,
+                                exit_price: Some(current_price),
+                                size_usd: trade.size_usd,
+                                leverage: trade.leverage,
+                                pnl_usd: Some(pnl),
+                                exit_reason: Some("expired".to_string()),
+                                llm_reasoning: trade.llm_reasoning.clone(),
+                                capital_after: Some(risk.current_equity()),
+                            };
+                            let _ = journal.log_entry(&record);
+
                             let _ = tui_tx_clone.send(TuiUpdate::Log(format!(
-                                "[{}] Position {} expired — force closed",
+                                "[{}] Position {} expired — force closed, PnL: ${:.2}",
                                 chrono::Utc::now().format("%H:%M:%S"),
-                                trade.id,
+                                trade.id, pnl,
                             ))).await;
                         }
                     }
@@ -327,7 +421,11 @@ async fn main() -> Result<()> {
                             trigger,
                         );
 
+                        // Generate 20-trade report on trade-count triggers
+                        let is_trade_count = matches!(&trigger, TuneTrigger::TradeCount(_));
+
                         drop(cfg); // Release read lock before write
+
                         match tune_client.tune(TUNE_SYSTEM_PROMPT, &tune_context).await {
                             Ok(tune_decision) => {
                                 let mut cfg_write = config_for_engine.write().await;
@@ -343,6 +441,29 @@ async fn main() -> Result<()> {
                                 tuner.mark_tuned(); // Reset timer to avoid retry spam
                             }
                         }
+
+                        // Report generation (only on trade-count triggers)
+                        if is_trade_count {
+                            let recent = journal.read_recent(20).unwrap_or_default();
+                            if !recent.is_empty() {
+                                match reporter.generate(&recent, &memory).await {
+                                    Ok(result) => {
+                                        let _ = tui_tx_clone.send(TuiUpdate::Log(format!(
+                                            "[{}] Report generated: {}",
+                                            chrono::Utc::now().format("%H:%M:%S"),
+                                            result.summary,
+                                        ))).await;
+                                        // Telegram report alert
+                                        if let Some(ref tg) = telegram {
+                                            let s = result.summary.clone();
+                                            let tg_ref = tg.clone();
+                                            tokio::spawn(async move { tg_ref.send_report(&s).await });
+                                        }
+                                    }
+                                    Err(e) => warn!("Report generation failed: {e:#}"),
+                                }
+                            }
+                        }
                     } else {
                         drop(cfg);
                     }
@@ -352,6 +473,7 @@ async fn main() -> Result<()> {
                         let cfg = config_for_engine.read().await;
                         if risk.should_kill(&cfg) && !kill_switch.triggered {
                             kill_switch.trigger();
+                            aggregator.set_kill_switch(true);
                             if let Some(ref hl) = hl_executor {
                                 let _ = hl.close_all().await;
                             }
@@ -360,6 +482,11 @@ async fn main() -> Result<()> {
                                 "[{}] KILL SWITCH — drawdown limit hit",
                                 chrono::Utc::now().format("%H:%M:%S"),
                             ))).await;
+                            // Telegram kill switch alert
+                            if let Some(ref tg) = telegram {
+                                let tg_ref = tg.clone();
+                                tokio::spawn(async move { tg_ref.send_kill_switch().await });
+                            }
                         }
                     }
                 }
@@ -384,6 +511,8 @@ async fn main() -> Result<()> {
                 TuiUpdate::Price(p) => app.update_price(p),
                 TuiUpdate::Signal(s) => app.update_signal(s),
                 TuiUpdate::Log(l) => app.push_log(l),
+                TuiUpdate::Positions(p) => app.update_positions(p),
+                TuiUpdate::Stats(s) => app.update_stats(s),
             }
         }
 
@@ -419,7 +548,7 @@ async fn handle_llm_decision(
     risk: &mut RiskChecker,
     position_monitor: &mut PositionMonitor,
     second_look: &mut SecondLookScheduler,
-    tuner: &mut SignalTuner,
+    _tuner: &mut SignalTuner,
     hl_executor: &Option<HlExecutor>,
     journal: &TradeLogger,
     tui_tx: &mpsc::Sender<TuiUpdate>,
@@ -514,8 +643,31 @@ async fn handle_llm_decision(
                 signal_level: snapshot.level,
                 signal_score: snapshot.net_score,
             };
+            let trade_id = trade.id;
+            let trade_opened_at = trade.opened_at;
             position_monitor.add_trade(trade);
             risk.set_open_positions(position_monitor.open_count());
+
+            // Journal the open trade
+            let open_record = TradeRecord {
+                id: trade_id,
+                ts_open: trade_opened_at,
+                ts_close: None,
+                duration_secs: None,
+                play_type: *play_type,
+                direction: *direction,
+                signal_level: snapshot.level,
+                signal_score: snapshot.net_score,
+                entry_price,
+                exit_price: None,
+                size_usd,
+                leverage: Some(leverage),
+                pnl_usd: None,
+                exit_reason: None,
+                llm_reasoning: reasoning.clone(),
+                capital_after: None,
+            };
+            let _ = journal.log_entry(&open_record);
 
             let _ = tui_tx.send(TuiUpdate::Log(format!(
                 "[{}] EXECUTE {} {} ${:.0} @{:.0} lev={} — {}",

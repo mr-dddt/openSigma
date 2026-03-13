@@ -8,6 +8,7 @@ pub struct SecondLookScheduler {
     max_second_looks: u32,
 }
 
+#[allow(dead_code)]
 pub struct SecondLookEntry {
     pub recheck_at: DateTime<Utc>,
     pub original_bias: Direction,
@@ -64,10 +65,12 @@ impl SecondLookScheduler {
         due
     }
 
+    #[allow(dead_code)]
     pub fn clear_all(&mut self) {
         self.pending.clear();
     }
 
+    #[allow(dead_code)]
     pub fn has_pending(&self) -> bool {
         !self.pending.is_empty()
     }

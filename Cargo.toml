@@ -27,8 +27,8 @@ crossterm = "0.28"
 # Crypto / signing
 ethers = { version = "2", features = ["rustls"] }
 
-# Database
-rusqlite = { version = "0.32", features = ["bundled"] }
+# Exchange SDKs
+hyperliquid_rust_sdk = "0.6"
 
 # Time
 chrono = { version = "0.4", features = ["serde"] }

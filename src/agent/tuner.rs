@@ -15,6 +15,7 @@ pub struct SignalTuner {
     inactivity_triggered: bool,
 }
 
+#[allow(dead_code)]
 #[derive(Debug)]
 pub enum TuneTrigger {
     TradeCount(u64),
@@ -121,6 +122,7 @@ impl SignalTuner {
         self.mark_tuned();
     }
 
+    #[allow(dead_code)]
     pub fn trade_count(&self) -> u64 {
         self.trade_count
     }

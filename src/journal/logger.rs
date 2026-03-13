@@ -45,17 +45,19 @@ impl TradeLogger {
         let reader = BufReader::new(file);
         let all_lines: Vec<String> = reader.lines().filter_map(|l| l.ok()).collect();
 
-        let records: Vec<TradeRecord> = all_lines
+        let mut records: Vec<TradeRecord> = all_lines
             .iter()
             .rev()
             .take(n)
             .filter_map(|line| serde_json::from_str(line).ok())
             .collect();
+        records.reverse(); // chronological order
 
         Ok(records)
     }
 
     /// Count total trades logged.
+    #[allow(dead_code)]
     pub fn trade_count(&self) -> usize {
         match std::fs::File::open(&self.path) {
             Ok(f) => BufReader::new(f).lines().count(),

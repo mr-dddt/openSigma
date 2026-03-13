@@ -92,6 +92,16 @@ impl LlmClient {
         })
     }
 
+    /// Generic prompt: send system + user prompt, return raw text response.
+    pub async fn prompt(
+        &self,
+        system_prompt: &str,
+        user_prompt: &str,
+        max_tokens: u32,
+    ) -> Result<String> {
+        self.call_api(system_prompt, user_prompt, max_tokens).await
+    }
+
     /// Send trade history + memory to Claude for signal engine tuning.
     pub async fn tune(
         &self,

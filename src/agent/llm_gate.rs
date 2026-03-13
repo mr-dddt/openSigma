@@ -1,3 +1,5 @@
+use std::sync::Arc;
+
 use anyhow::Result;
 use tracing::info;
 
@@ -31,11 +33,11 @@ Rules:
 /// parses the LlmDecision response.
 pub struct LlmGate {
     client: LlmClient,
-    memory: MemoryManager,
+    memory: Arc<MemoryManager>,
 }
 
 impl LlmGate {
-    pub fn new(client: LlmClient, memory: MemoryManager) -> Self {
+    pub fn new(client: LlmClient, memory: Arc<MemoryManager>) -> Self {
         Self { client, memory }
     }
 

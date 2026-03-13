@@ -225,6 +225,7 @@ impl HyperliquidFeed {
 
 #[derive(Debug, Deserialize)]
 #[serde(untagged)]
+#[allow(dead_code)]
 enum HlWsMessage {
     AllMids(AllMidsEnvelope),
     Trades(TradesEnvelope),

@@ -40,6 +40,10 @@ impl SignalAggregator {
         self.latest_price = price;
     }
 
+    pub fn latest_price(&self) -> f64 {
+        self.latest_price
+    }
+
     pub fn update_funding(&mut self, rate: f64) {
         self.latest_funding = rate;
     }
@@ -60,6 +64,7 @@ impl SignalAggregator {
         self.kill_switch_triggered = triggered;
     }
 
+    #[allow(dead_code)] // will be wired when NewsFeed sends events
     pub fn set_news_circuit_breaker(&mut self, active: bool) {
         self.news_circuit_breaker = active;
     }

@@ -1,16 +1,20 @@
 use anyhow::{Context, Result};
 use ethers::signers::{LocalWallet, Signer};
-use serde::Deserialize;
 use tracing::{info, warn};
 
-const HL_API_URL: &str = "https://api.hyperliquid.xyz";
+use hyperliquid_rust_sdk::{
+    BaseUrl, ClientOrder, ClientOrderRequest, ClientTrigger,
+    ExchangeClient, ExchangeResponseStatus, ExchangeDataStatus,
+    InfoClient, MarketOrderParams,
+};
 
-/// Hyperliquid order executor — places perp orders via REST API with EIP-712 signing.
+/// Hyperliquid order executor — uses the official SDK for proper EIP-712 signing.
 pub struct HlExecutor {
-    client: reqwest::Client,
+    exchange: ExchangeClient,
     wallet: LocalWallet,
 }
 
+#[allow(dead_code)]
 #[derive(Debug, Clone)]
 pub struct OrderResult {
     pub success: bool,
@@ -19,7 +23,8 @@ pub struct OrderResult {
     pub message: String,
 }
 
-#[derive(Debug, Clone, Deserialize)]
+#[allow(dead_code)]
+#[derive(Debug, Clone)]
 pub struct HlPosition {
     pub coin: String,
     pub size: f64,
@@ -29,18 +34,21 @@ pub struct HlPosition {
 }
 
 impl HlExecutor {
-    pub fn new(private_key: &str) -> Result<Self> {
+    pub async fn new(private_key: &str) -> Result<Self> {
         let wallet: LocalWallet = private_key
             .parse()
             .context("Failed to parse HL private key")?;
-        info!(address = %wallet.address(), "HlExecutor initialized");
-        Ok(Self {
-            client: reqwest::Client::new(),
-            wallet,
-        })
+        info!(address = %wallet.address(), "HlExecutor initializing with SDK...");
+
+        let exchange = ExchangeClient::new(None, wallet.clone(), Some(BaseUrl::Mainnet), None, None)
+            .await
+            .map_err(|e| anyhow::anyhow!("Failed to initialize ExchangeClient: {e:?}"))?;
+
+        info!("HlExecutor initialized with proper EIP-712 signing");
+        Ok(Self { exchange, wallet })
     }
 
-    /// Place a market order (IOC).
+    /// Place a market order (IOC) via SDK.
     pub async fn market_order(
         &self,
         coin: &str,
@@ -48,25 +56,30 @@ impl HlExecutor {
         sz: f64,
         leverage: u8,
     ) -> Result<OrderResult> {
-        self.set_leverage(coin, leverage).await?;
+        // Set leverage first
+        self.exchange
+            .update_leverage(leverage as u32, coin, true, None)
+            .await
+            .map_err(|e| anyhow::anyhow!("Failed to set leverage: {e:?}"))?;
 
-        let action = serde_json::json!({
-            "type": "order",
-            "orders": [{
-                "a": self.coin_index(coin),
-                "b": is_buy,
-                "p": "0",
-                "s": format!("{:.4}", sz),
-                "r": false,
-                "t": {"limit": {"tif": "Ioc"}}
-            }],
-            "grouping": "na"
-        });
+        // Place market order via SDK (handles slippage internally)
+        let result = self
+            .exchange
+            .market_open(MarketOrderParams {
+                asset: coin,
+                is_buy,
+                sz,
+                px: None,
+                slippage: Some(0.05), // 5% slippage tolerance
+                cloid: None,
+                wallet: None,
+            })
+            .await;
 
-        self.send_exchange_action(action).await
+        Self::parse_response(result)
     }
 
-    /// Place a stop-loss trigger order.
+    /// Place a stop-loss trigger order via SDK.
     pub async fn stop_loss(
         &self,
         coin: &str,
@@ -74,27 +87,25 @@ impl HlExecutor {
         sz: f64,
         is_buy: bool,
     ) -> Result<OrderResult> {
-        let action = serde_json::json!({
-            "type": "order",
-            "orders": [{
-                "a": self.coin_index(coin),
-                "b": is_buy,
-                "p": "0",
-                "s": format!("{:.4}", sz),
-                "r": true,
-                "t": {"trigger": {
-                    "triggerPx": format!("{:.2}", trigger_px),
-                    "isMarket": true,
-                    "tpsl": "sl"
-                }}
-            }],
-            "grouping": "na"
-        });
+        let order = ClientOrderRequest {
+            asset: coin.to_string(),
+            is_buy,
+            reduce_only: true,
+            limit_px: trigger_px,
+            sz,
+            cloid: None,
+            order_type: ClientOrder::Trigger(ClientTrigger {
+                trigger_px,
+                is_market: true,
+                tpsl: "sl".to_string(),
+            }),
+        };
 
-        self.send_exchange_action(action).await
+        let result = self.exchange.order(order, None).await;
+        Self::parse_response(result)
     }
 
-    /// Place a take-profit trigger order.
+    /// Place a take-profit trigger order via SDK.
     pub async fn take_profit(
         &self,
         coin: &str,
@@ -102,66 +113,52 @@ impl HlExecutor {
         sz: f64,
         is_buy: bool,
     ) -> Result<OrderResult> {
-        let action = serde_json::json!({
-            "type": "order",
-            "orders": [{
-                "a": self.coin_index(coin),
-                "b": is_buy,
-                "p": "0",
-                "s": format!("{:.4}", sz),
-                "r": true,
-                "t": {"trigger": {
-                    "triggerPx": format!("{:.2}", trigger_px),
-                    "isMarket": true,
-                    "tpsl": "tp"
-                }}
-            }],
-            "grouping": "na"
-        });
+        let order = ClientOrderRequest {
+            asset: coin.to_string(),
+            is_buy,
+            reduce_only: true,
+            limit_px: trigger_px,
+            sz,
+            cloid: None,
+            order_type: ClientOrder::Trigger(ClientTrigger {
+                trigger_px,
+                is_market: true,
+                tpsl: "tp".to_string(),
+            }),
+        };
 
-        self.send_exchange_action(action).await
+        let result = self.exchange.order(order, None).await;
+        Self::parse_response(result)
     }
 
-    /// Query current positions.
+    /// Query current positions via InfoClient.
     pub async fn positions(&self) -> Result<Vec<HlPosition>> {
-        let body = serde_json::json!({
-            "type": "clearinghouseState",
-            "user": format!("{:?}", self.wallet.address())
-        });
-
-        let resp = self
-            .client
-            .post(format!("{}/info", HL_API_URL))
-            .json(&body)
-            .send()
+        let info = InfoClient::new(None, Some(BaseUrl::Mainnet))
             .await
-            .context("Failed to query HL positions")?;
+            .map_err(|e| anyhow::anyhow!("Failed to create InfoClient: {e:?}"))?;
 
-        let data: serde_json::Value = resp.json().await?;
+        let state = info
+            .user_state(self.wallet.address())
+            .await
+            .map_err(|e| anyhow::anyhow!("Failed to query user state: {e:?}"))?;
 
-        let positions = data
-            .get("assetPositions")
-            .and_then(|v| v.as_array())
-            .map(|arr| {
-                arr.iter()
-                    .filter_map(|p| {
-                        let pos = p.get("position")?;
-                        Some(HlPosition {
-                            coin: pos.get("coin")?.as_str()?.to_string(),
-                            size: pos.get("szi")?.as_str()?.parse().ok()?,
-                            entry_px: pos.get("entryPx")?.as_str()?.parse().ok()?,
-                            unrealized_pnl: pos.get("unrealizedPnl")?.as_str()?.parse().ok()?,
-                            leverage: pos
-                                .get("leverage")
-                                .and_then(|l| l.get("value"))
-                                .and_then(|v| v.as_u64())
-                                .unwrap_or(1) as u8,
-                        })
-                    })
-                    .filter(|p| p.size.abs() > 0.0)
-                    .collect()
+        let positions = state
+            .asset_positions
+            .iter()
+            .filter_map(|ap| {
+                let szi: f64 = ap.position.szi.parse().ok()?;
+                if szi.abs() < 1e-12 {
+                    return None;
+                }
+                Some(HlPosition {
+                    coin: ap.position.coin.clone(),
+                    size: szi,
+                    entry_px: ap.position.entry_px.as_ref()?.parse().ok()?,
+                    unrealized_pnl: ap.position.unrealized_pnl.parse().unwrap_or(0.0),
+                    leverage: ap.position.leverage.value as u8,
+                })
             })
-            .unwrap_or_default();
+            .collect();
 
         Ok(positions)
     }
@@ -178,89 +175,56 @@ impl HlExecutor {
         Ok(())
     }
 
-    async fn set_leverage(&self, coin: &str, leverage: u8) -> Result<()> {
-        let action = serde_json::json!({
-            "type": "updateLeverage",
-            "asset": self.coin_index(coin),
-            "isCross": true,
-            "leverage": leverage
-        });
-        self.send_exchange_action(action).await?;
-        Ok(())
-    }
+    fn parse_response(
+        result: std::result::Result<ExchangeResponseStatus, hyperliquid_rust_sdk::Error>,
+    ) -> Result<OrderResult> {
+        match result {
+            Ok(ExchangeResponseStatus::Ok(resp)) => {
+                let statuses = resp.data.as_ref().map(|d| &d.statuses);
+                let first = statuses.and_then(|s| s.first());
 
-    async fn send_exchange_action(&self, action: serde_json::Value) -> Result<OrderResult> {
-        let nonce = chrono::Utc::now().timestamp_millis() as u64;
+                let (order_id, filled_price) = match first {
+                    Some(ExchangeDataStatus::Filled(f)) => (
+                        Some(f.oid.to_string()),
+                        f.avg_px.parse::<f64>().ok(),
+                    ),
+                    Some(ExchangeDataStatus::Resting(r)) => (Some(r.oid.to_string()), None),
+                    Some(ExchangeDataStatus::WaitingForTrigger) => (None, None),
+                    _ => (None, None),
+                };
 
-        // Hyperliquid EIP-712 signing: hash the action+nonce payload
-        let payload = serde_json::json!({
-            "action": action,
-            "nonce": nonce,
-            "vaultAddress": null
-        });
-        let payload_bytes = serde_json::to_vec(&payload)?;
-        let hash = ethers::utils::keccak256(&payload_bytes);
-        let signature = self
-            .wallet
-            .sign_hash(hash.into())
-            .context("Failed to sign HL action")?;
+                let success = matches!(
+                    first,
+                    Some(ExchangeDataStatus::Filled(_))
+                        | Some(ExchangeDataStatus::Resting(_))
+                        | Some(ExchangeDataStatus::WaitingForTrigger)
+                );
 
-        let body = serde_json::json!({
-            "action": action,
-            "nonce": nonce,
-            "signature": {
-                "r": format!("0x{:064x}", signature.r),
-                "s": format!("0x{:064x}", signature.s),
-                "v": signature.v as u8
+                Ok(OrderResult {
+                    success,
+                    order_id,
+                    filled_price,
+                    message: format!("{:?}", first),
+                })
             }
-        });
-
-        let resp = self
-            .client
-            .post(format!("{}/exchange", HL_API_URL))
-            .json(&body)
-            .send()
-            .await
-            .context("Failed to send HL exchange action")?;
-
-        let status = resp.status();
-        let resp_body: serde_json::Value = resp.json().await.unwrap_or_default();
-
-        if status.is_success() {
-            let status_str = resp_body
-                .get("status")
-                .and_then(|s| s.as_str())
-                .unwrap_or("unknown");
-
-            Ok(OrderResult {
-                success: status_str == "ok",
-                order_id: resp_body
-                    .pointer("/response/data/statuses/0/resting/oid")
-                    .or_else(|| resp_body.pointer("/response/data/statuses/0/filled/oid"))
-                    .and_then(|o| o.as_u64())
-                    .map(|o| o.to_string()),
-                filled_price: resp_body
-                    .pointer("/response/data/statuses/0/filled/avgPx")
-                    .and_then(|p| p.as_str())
-                    .and_then(|p| p.parse().ok()),
-                message: resp_body.to_string(),
-            })
-        } else {
-            warn!(status = %status, body = %resp_body, "HL order failed");
-            Ok(OrderResult {
-                success: false,
-                order_id: None,
-                filled_price: None,
-                message: resp_body.to_string(),
-            })
-        }
-    }
-
-    fn coin_index(&self, coin: &str) -> u32 {
-        match coin {
-            "BTC" => 0,
-            "ETH" => 1,
-            _ => 0,
+            Ok(ExchangeResponseStatus::Err(msg)) => {
+                warn!(msg = %msg, "HL order rejected");
+                Ok(OrderResult {
+                    success: false,
+                    order_id: None,
+                    filled_price: None,
+                    message: msg,
+                })
+            }
+            Err(e) => {
+                warn!(error = %format!("{e:?}"), "HL order error");
+                Ok(OrderResult {
+                    success: false,
+                    order_id: None,
+                    filled_price: None,
+                    message: format!("{e:?}"),
+                })
+            }
         }
     }
 }

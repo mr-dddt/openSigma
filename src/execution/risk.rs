@@ -8,6 +8,9 @@ pub struct RiskChecker {
     peak_equity: f64,
     current_equity: f64,
     open_positions: u32,
+    total_wins: u64,
+    total_closed: u64,
+    streak: i32, // positive = consecutive wins, negative = consecutive losses
 }
 
 impl RiskChecker {
@@ -17,6 +20,9 @@ impl RiskChecker {
             peak_equity: initial_equity,
             current_equity: initial_equity,
             open_positions: 0,
+            total_wins: 0,
+            total_closed: 0,
+            streak: 0,
         }
     }
 
@@ -82,6 +88,7 @@ impl RiskChecker {
     }
 
     /// Update equity after a trade closes.
+    #[allow(dead_code)]
     pub fn update_equity(&mut self, new_equity: f64) {
         self.current_equity = new_equity;
         if new_equity > self.peak_equity {
@@ -89,7 +96,7 @@ impl RiskChecker {
         }
     }
 
-    /// Record trade PnL for daily loss tracking.
+    /// Record trade PnL for daily loss tracking + win/loss stats.
     pub fn record_trade_pnl(&mut self, pnl_usd: f64) {
         if pnl_usd < 0.0 {
             self.daily_loss_usd += pnl_usd.abs();
@@ -97,6 +104,15 @@ impl RiskChecker {
         self.current_equity += pnl_usd;
         if self.current_equity > self.peak_equity {
             self.peak_equity = self.current_equity;
+        }
+
+        // Track win/loss stats
+        self.total_closed += 1;
+        if pnl_usd >= 0.0 {
+            self.total_wins += 1;
+            self.streak = if self.streak >= 0 { self.streak + 1 } else { 1 };
+        } else {
+            self.streak = if self.streak <= 0 { self.streak - 1 } else { -1 };
         }
     }
 
@@ -118,8 +134,25 @@ impl RiskChecker {
         self.current_equity
     }
 
+    #[allow(dead_code)]
     pub fn daily_pnl_pct(&self, config: &Config) -> f64 {
         let pnl = self.current_equity - config.capital.initial_usd;
         (pnl / config.capital.initial_usd) * 100.0
+    }
+
+    pub fn win_rate(&self) -> f64 {
+        if self.total_closed == 0 {
+            0.0
+        } else {
+            self.total_wins as f64 / self.total_closed as f64
+        }
+    }
+
+    pub fn streak(&self) -> i32 {
+        self.streak
+    }
+
+    pub fn total_closed(&self) -> u64 {
+        self.total_closed
     }
 }

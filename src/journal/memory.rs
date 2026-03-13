@@ -22,6 +22,7 @@ impl MemoryManager {
     }
 
     /// Update memory with new content (e.g., after tuning or 20-trade report).
+    #[allow(dead_code)]
     pub fn update(&self, content: &str) -> Result<()> {
         std::fs::write(&self.path, content)?;
         info!("Memory updated");

@@ -6,7 +6,9 @@ use crate::types::BinarySide;
 
 const PM_CLOB_URL: &str = "https://clob.polymarket.com";
 
+#[allow(dead_code)] // PM trading not yet wired in main loop
 /// Polymarket order executor — places binary market maker limit orders.
+/// Uses the 3-part credential system (API key, secret, passphrase).
 pub struct PmExecutor {
     client: reqwest::Client,
     api_key: String,
@@ -14,6 +16,7 @@ pub struct PmExecutor {
     passphrase: String,
 }
 
+#[allow(dead_code)]
 #[derive(Debug, Clone)]
 pub struct PmOrderResult {
     pub success: bool,
@@ -21,6 +24,7 @@ pub struct PmOrderResult {
     pub message: String,
 }
 
+#[allow(dead_code)]
 #[derive(Debug, Clone, Deserialize)]
 pub struct PmPosition {
     pub token_id: String,
@@ -28,16 +32,20 @@ pub struct PmPosition {
     pub avg_price: f64,
 }
 
+#[allow(dead_code)]
 impl PmExecutor {
-    pub fn new(private_key: &str) -> Self {
-        // PM uses API key derived from private key for CLOB access
-        // In production, these should be obtained via PM's API key creation flow
-        info!("PmExecutor initialized");
+    pub fn new(api_key: &str, api_secret: &str, passphrase: &str) -> Self {
+        let has_creds = !api_key.is_empty() && !api_secret.is_empty() && !passphrase.is_empty();
+        if has_creds {
+            info!("PmExecutor initialized with API credentials");
+        } else {
+            warn!("PmExecutor initialized without credentials — PM trading disabled");
+        }
         Self {
             client: reqwest::Client::new(),
-            api_key: private_key.to_string(),
-            api_secret: String::new(),
-            passphrase: String::new(),
+            api_key: api_key.to_string(),
+            api_secret: api_secret.to_string(),
+            passphrase: passphrase.to_string(),
         }
     }
 

@@ -6,8 +6,12 @@ use std::collections::HashMap;
 #[derive(Debug, Clone)]
 pub struct Secrets {
     pub hl_private_key: String,
-    pub pm_private_key: String,
+    pub pm_api_key: String,
+    pub pm_api_secret: String,
+    pub pm_passphrase: String,
     pub anthropic_api_key: String,
+    pub telegram_bot_token: String,
+    pub telegram_chat_id: String,
 }
 
 impl Secrets {
@@ -16,13 +20,19 @@ impl Secrets {
         Ok(Self {
             hl_private_key: std::env::var("HL_PRIVATE_KEY")
                 .context("HL_PRIVATE_KEY must be set in .env")?,
-            pm_private_key: std::env::var("PM_PRIVATE_KEY").unwrap_or_default(),
-            anthropic_api_key: std::env::var("ANTHROPIC_API_KEY").unwrap_or_default(),
+            pm_api_key: std::env::var("POLY_API_KEY").unwrap_or_default(),
+            pm_api_secret: std::env::var("POLY_API_SECRET").unwrap_or_default(),
+            pm_passphrase: std::env::var("POLY_PASSPHRASE").unwrap_or_default(),
+            anthropic_api_key: std::env::var("ANTHROPIC_API_KEY")
+                .context("ANTHROPIC_API_KEY must be set in .env")?,
+            telegram_bot_token: std::env::var("TELEGRAM_BOT_TOKEN").unwrap_or_default(),
+            telegram_chat_id: std::env::var("TELEGRAM_CHAT_ID").unwrap_or_default(),
         })
     }
 }
 
 /// Full config loaded from config.toml
+#[allow(dead_code)] // polymarket config read from TOML but not yet wired
 #[derive(Debug, Clone, Deserialize)]
 pub struct Config {
     pub capital: CapitalConfig,
@@ -34,6 +44,8 @@ pub struct Config {
     pub signals: SignalConfig,
     #[serde(default)]
     pub tuning: TuningConfig,
+    #[serde(default)]
+    pub telegram: TelegramConfig,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -50,6 +62,7 @@ pub struct HlConfig {
     pub max_leverage: u8,
 }
 
+#[allow(dead_code)] // PM config loaded from TOML, will be used when PM is wired
 #[derive(Debug, Clone, Deserialize)]
 pub struct PmConfig {
     pub max_bet_usd: f64,
@@ -118,6 +131,18 @@ pub struct TuningConfig {
 fn default_tune_trades() -> u64 { 20 }
 fn default_inactivity() -> u64 { 600 }
 
+#[derive(Debug, Clone, Deserialize)]
+pub struct TelegramConfig {
+    #[serde(default)]
+    pub enabled: bool,
+}
+
+impl Default for TelegramConfig {
+    fn default() -> Self {
+        Self { enabled: false }
+    }
+}
+
 impl Default for TuningConfig {
     fn default() -> Self {
         Self {
@@ -138,11 +163,18 @@ impl Config {
 
     /// Check if we're in an active trading session. Returns (in_session, size_multiplier).
     pub fn active_session(&self) -> (bool, f64) {
-        let now = chrono::Utc::now();
-        let hour_min = now.format("%H:%M").to_string();
-
+        let now = chrono::Utc::now().time();
         for session in self.sessions.values() {
-            if hour_min >= session.start && hour_min < session.end {
+            let start = chrono::NaiveTime::parse_from_str(&session.start, "%H:%M")
+                .unwrap_or(chrono::NaiveTime::from_hms_opt(0, 0, 0).unwrap());
+            let end = chrono::NaiveTime::parse_from_str(&session.end, "%H:%M")
+                .unwrap_or(chrono::NaiveTime::from_hms_opt(0, 0, 0).unwrap());
+            let in_session = if start <= end {
+                now >= start && now < end
+            } else {
+                now >= start || now < end // spans midnight
+            };
+            if in_session {
                 return (true, session.size_mult);
             }
         }

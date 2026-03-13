@@ -40,6 +40,7 @@ impl std::fmt::Display for Direction {
 // Market data types (from data feeds)
 // ---------------------------------------------------------------------------
 
+#[allow(dead_code)] // fields populated by data feed
 #[derive(Debug, Clone)]
 pub struct PriceTick {
     pub symbol: Symbol,
@@ -47,6 +48,7 @@ pub struct PriceTick {
     pub timestamp: DateTime<Utc>,
 }
 
+#[allow(dead_code)] // fields populated by data feed
 #[derive(Debug, Clone)]
 pub struct TradeTick {
     pub symbol: Symbol,
@@ -56,6 +58,7 @@ pub struct TradeTick {
     pub timestamp: DateTime<Utc>,
 }
 
+#[allow(dead_code)] // fields populated by data feed
 #[derive(Debug, Clone)]
 pub struct OrderBookSnapshot {
     pub symbol: Symbol,
@@ -64,6 +67,7 @@ pub struct OrderBookSnapshot {
     pub timestamp: DateTime<Utc>,
 }
 
+#[allow(dead_code)] // fields used by data feed structs
 #[derive(Debug, Clone)]
 pub struct FundingTick {
     pub symbol: Symbol,
@@ -71,6 +75,7 @@ pub struct FundingTick {
     pub timestamp: DateTime<Utc>,
 }
 
+#[allow(dead_code)] // Phase 2 stub — will be wired when liquidation feed is added
 #[derive(Debug, Clone)]
 pub struct LiquidationTick {
     pub symbol: Symbol,
@@ -81,6 +86,7 @@ pub struct LiquidationTick {
 }
 
 /// Candle (OHLCV) for indicator computation.
+#[allow(dead_code)] // some fields used internally by indicators
 #[derive(Debug, Clone)]
 pub struct Candle {
     pub open: f64,
@@ -92,6 +98,7 @@ pub struct Candle {
 }
 
 /// Polymarket binary market odds.
+#[allow(dead_code)] // fields used by PM feed
 #[derive(Debug, Clone)]
 pub struct PmOdds {
     pub market_id: String,
@@ -120,6 +127,7 @@ impl std::fmt::Display for PmWindow {
 // Unified market data event (sent through channels)
 // ---------------------------------------------------------------------------
 
+#[allow(dead_code)] // Liquidation and PmOdds variants are Phase 2 stubs
 #[derive(Debug, Clone)]
 pub enum MarketEvent {
     Price(PriceTick),
@@ -188,7 +196,7 @@ pub struct IndicatorValues {
 // Play types & LLM decisions
 // ---------------------------------------------------------------------------
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub enum PlayType {
     PurePerpScalp,
     PureBinaryBet,
@@ -290,6 +298,7 @@ pub struct TradeRecord {
 // Execution types
 // ---------------------------------------------------------------------------
 
+#[allow(dead_code)] // symbol and pm_hedge will be used when multi-asset + PM hedge is wired
 #[derive(Debug, Clone)]
 pub struct ActiveTrade {
     pub id: Uuid,

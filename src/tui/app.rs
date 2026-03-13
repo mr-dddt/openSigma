@@ -1,9 +1,35 @@
 use ratatui::{
-    prelude::*,
+    prelude::{Color, Constraint, Frame, Layout, Line, Rect, Span, Style, Stylize},
     widgets::{Block, Borders, List, ListItem, Paragraph},
 };
+use uuid::Uuid;
 
-use crate::types::*;
+use crate::types::{
+    AgentStatus, Direction, PlayType, SignalLevel, SignalSnapshot,
+};
+
+// TUI-specific display types
+
+#[allow(dead_code)]
+#[derive(Debug, Clone)]
+pub struct PositionInfo {
+    pub id: Uuid,
+    pub direction: Direction,
+    pub play_type: PlayType,
+    pub entry_price: f64,
+    pub size_usd: f64,
+    pub leverage: u8,
+    pub unrealized_pnl: f64,
+    pub duration_secs: u64,
+}
+
+#[derive(Debug, Clone, Default)]
+pub struct PerformanceStats {
+    pub total_trades: u64,
+    pub win_rate: f64,
+    pub total_pnl: f64,
+    pub streak: i32,
+}
 
 pub struct App {
     // State
@@ -13,6 +39,9 @@ pub struct App {
     pub trade_log: Vec<String>,
     pub equity: f64,
     pub daily_pnl: f64,
+    // Phase 3 additions
+    pub positions: Vec<PositionInfo>,
+    pub stats: PerformanceStats,
 }
 
 impl App {
@@ -24,6 +53,8 @@ impl App {
             trade_log: Vec::new(),
             equity: initial_equity,
             daily_pnl: 0.0,
+            positions: Vec::new(),
+            stats: PerformanceStats::default(),
         }
     }
 
@@ -44,70 +75,232 @@ impl App {
         self.trade_log.push(line);
     }
 
+    pub fn update_positions(&mut self, positions: Vec<PositionInfo>) {
+        self.positions = positions;
+        if !self.positions.is_empty() {
+            self.status = AgentStatus::InPosition;
+        }
+    }
+
+    pub fn update_stats(&mut self, stats: PerformanceStats) {
+        self.stats = stats;
+    }
+
     pub fn render_frame(&self, frame: &mut Frame) {
         let chunks = Layout::default()
             .direction(ratatui::layout::Direction::Vertical)
             .constraints([
-                Constraint::Length(7),
-                Constraint::Min(10),
-                Constraint::Length(3),
+                Constraint::Length(7),  // top: status + signal
+                Constraint::Length(5),  // positions
+                Constraint::Min(8),    // log
+                Constraint::Length(3), // footer: stats + keys
             ])
             .split(frame.area());
 
-        // Top: status + signal side by side
+        self.render_top(frame, chunks[0]);
+        self.render_positions(frame, chunks[1]);
+        self.render_log(frame, chunks[2]);
+        self.render_footer(frame, chunks[3]);
+    }
+
+    fn render_top(&self, frame: &mut Frame, area: Rect) {
         let top_chunks = Layout::default()
             .direction(ratatui::layout::Direction::Horizontal)
-            .constraints([Constraint::Percentage(40), Constraint::Percentage(60)])
-            .split(chunks[0]);
+            .constraints([Constraint::Percentage(35), Constraint::Percentage(65)])
+            .split(area);
 
         // Left: portfolio info
-        let status_text = format!(
-            " BTC:      ${:.2}\n Status:   [{}]\n Equity:   ${:.2}\n Daily PnL: {}{:.2}%",
-            self.btc_price,
-            self.status,
-            self.equity,
-            if self.daily_pnl >= 0.0 { "+" } else { "" },
-            self.daily_pnl,
-        );
-        let status_block = Paragraph::new(status_text)
-            .block(Block::default().borders(Borders::ALL).title(" openSigma v1 "));
+        let pnl_color = if self.daily_pnl >= 0.0 { Color::Green } else { Color::Red };
+        let pnl_sign = if self.daily_pnl >= 0.0 { "+" } else { "" };
+
+        let status_lines = vec![
+            Line::from(vec![
+                Span::styled(" BTC:      ", Style::default().fg(Color::Cyan)),
+                Span::styled(format!("${:.2}", self.btc_price), Style::default().fg(Color::White).bold()),
+            ]),
+            Line::from(vec![
+                Span::styled(" Status:   ", Style::default().fg(Color::Cyan)),
+                Span::styled(
+                    format!("[{}]", self.status),
+                    Style::default().fg(status_color(self.status)),
+                ),
+            ]),
+            Line::from(vec![
+                Span::styled(" Equity:   ", Style::default().fg(Color::Cyan)),
+                Span::styled(format!("${:.2}", self.equity), Style::default().fg(Color::White)),
+            ]),
+            Line::from(vec![
+                Span::styled(" Daily PnL:", Style::default().fg(Color::Cyan)),
+                Span::styled(
+                    format!(" {pnl_sign}{:.2}%", self.daily_pnl),
+                    Style::default().fg(pnl_color),
+                ),
+            ]),
+        ];
+
+        let status_block = Paragraph::new(status_lines)
+            .block(Block::default().borders(Borders::ALL).title(" openSigma v1 ").border_style(Style::default().fg(Color::Cyan)));
         frame.render_widget(status_block, top_chunks[0]);
 
-        // Right: signal info
-        let signal_text = if let Some(ref sig) = self.latest_signal {
+        // Right: signal info with all indicators
+        let signal_lines = if let Some(ref sig) = self.latest_signal {
+            let ind = &sig.indicators;
             let filter = sig.filter_reason.as_deref().unwrap_or("none");
-            format!(
-                " Level: {}\n Score: bull={} bear={} net={}\n EMA: 9={:.0} 21={:.0}\n Filter: {}",
-                sig.level,
-                sig.bull_score,
-                sig.bear_score,
-                sig.net_score,
-                sig.indicators.ema_9.unwrap_or(0.0),
-                sig.indicators.ema_21.unwrap_or(0.0),
-                filter,
-            )
-        } else {
-            " Waiting for data...".to_string()
-        };
-        let signal_block = Paragraph::new(signal_text)
-            .block(Block::default().borders(Borders::ALL).title(" Signal "));
-        frame.render_widget(signal_block, top_chunks[1]);
+            let level_color = signal_level_color(sig.level);
 
-        // Middle: trade log
+            vec![
+                Line::from(vec![
+                    Span::styled(format!(" {}", sig.level), Style::default().fg(level_color).bold()),
+                    Span::raw(format!(" (net={:+})  ", sig.net_score)),
+                    Span::styled(format!("bull={} bear={}", sig.bull_score, sig.bear_score), Style::default().fg(Color::DarkGray)),
+                ]),
+                Line::from(vec![
+                    Span::styled(" EMA:", Style::default().fg(Color::Cyan)),
+                    Span::raw(format!(" 9={:.0} 21={:.0}", ind.ema_9.unwrap_or(0.0), ind.ema_21.unwrap_or(0.0))),
+                    Span::styled("  RSI:", Style::default().fg(Color::Cyan)),
+                    Span::raw(format!(" {:.1}", ind.rsi_14.unwrap_or(0.0))),
+                    Span::styled("  StochRSI:", Style::default().fg(Color::Cyan)),
+                    Span::raw(format!(" {:.1}", ind.stoch_rsi.unwrap_or(0.0))),
+                ]),
+                Line::from(vec![
+                    Span::styled(" CVD:", Style::default().fg(Color::Cyan)),
+                    Span::raw(format!(" {:+.2}", ind.cvd.unwrap_or(0.0))),
+                    Span::styled("  OB:", Style::default().fg(Color::Cyan)),
+                    Span::raw(format!(" {:.2}", ind.ob_imbalance.unwrap_or(1.0))),
+                    Span::styled("  ATR%:", Style::default().fg(Color::Cyan)),
+                    Span::raw(format!(" {:.3}", ind.atr_pct.unwrap_or(0.0))),
+                    if ind.bb_squeeze {
+                        Span::styled("  BB:SQUEEZE", Style::default().fg(Color::Yellow))
+                    } else {
+                        Span::raw("")
+                    },
+                ]),
+                Line::from(vec![
+                    Span::styled(" Filter: ", Style::default().fg(Color::DarkGray)),
+                    Span::styled(filter, Style::default().fg(if filter == "none" { Color::DarkGray } else { Color::Yellow })),
+                ]),
+            ]
+        } else {
+            vec![Line::from(Span::styled(" Waiting for data...", Style::default().fg(Color::DarkGray)))]
+        };
+
+        let signal_block = Paragraph::new(signal_lines)
+            .block(Block::default().borders(Borders::ALL).title(" Signal ").border_style(Style::default().fg(Color::Cyan)));
+        frame.render_widget(signal_block, top_chunks[1]);
+    }
+
+    fn render_positions(&self, frame: &mut Frame, area: Rect) {
+        let title = format!(" Positions [{}/2] ", self.positions.len());
+        let items: Vec<ListItem> = if self.positions.is_empty() {
+            vec![ListItem::new(Span::styled("  No active positions", Style::default().fg(Color::DarkGray)))]
+        } else {
+            self.positions.iter().map(|p| {
+                let pnl_color = if p.unrealized_pnl >= 0.0 { Color::Green } else { Color::Red };
+                let dir_color = if p.direction == Direction::Long { Color::Green } else { Color::Red };
+                let mins = p.duration_secs / 60;
+                let secs = p.duration_secs % 60;
+
+                ListItem::new(Line::from(vec![
+                    Span::styled(format!(" {} ", p.direction), Style::default().fg(dir_color).bold()),
+                    Span::raw(format!("{} ${:.0} @{:.0} lev={}  ", p.play_type, p.size_usd, p.entry_price, p.leverage)),
+                    Span::styled("PnL: ", Style::default().fg(Color::Cyan)),
+                    Span::styled(
+                        format!("${:+.2}", p.unrealized_pnl),
+                        Style::default().fg(pnl_color).bold(),
+                    ),
+                    Span::styled(format!(" ({m}m{s:02}s)", m = mins, s = secs), Style::default().fg(Color::DarkGray)),
+                ]))
+            }).collect()
+        };
+
+        let positions_block = List::new(items)
+            .block(Block::default().borders(Borders::ALL).title(title).border_style(Style::default().fg(Color::Cyan)));
+        frame.render_widget(positions_block, area);
+    }
+
+    fn render_log(&self, frame: &mut Frame, area: Rect) {
         let log_items: Vec<ListItem> = self
             .trade_log
             .iter()
             .rev()
-            .take(20)
-            .map(|line| ListItem::new(line.as_str()))
+            .take(area.height.saturating_sub(2) as usize)
+            .map(|line| {
+                let color = if line.contains("EXECUTE") {
+                    Color::Green
+                } else if line.contains("SKIP") || line.contains("SECOND_LOOK") {
+                    Color::Yellow
+                } else if line.contains("KILL") || line.contains("Risk") {
+                    Color::Red
+                } else if line.contains("Report") || line.contains("Tune") {
+                    Color::Cyan
+                } else {
+                    Color::White
+                };
+                ListItem::new(Span::styled(line.as_str(), Style::default().fg(color)))
+            })
             .collect();
-        let log_list = List::new(log_items)
-            .block(Block::default().borders(Borders::ALL).title(" Log "));
-        frame.render_widget(log_list, chunks[1]);
 
-        // Bottom: keybindings
-        let footer = Paragraph::new(" [q] quit  [k] kill switch")
-            .block(Block::default().borders(Borders::ALL));
-        frame.render_widget(footer, chunks[2]);
+        let log_list = List::new(log_items)
+            .block(Block::default().borders(Borders::ALL).title(" Log ").border_style(Style::default().fg(Color::Cyan)));
+        frame.render_widget(log_list, area);
+    }
+
+    fn render_footer(&self, frame: &mut Frame, area: Rect) {
+        let streak_str = if self.stats.streak > 0 {
+            format!("W{}", self.stats.streak)
+        } else if self.stats.streak < 0 {
+            format!("L{}", self.stats.streak.abs())
+        } else {
+            "—".to_string()
+        };
+        let streak_color = if self.stats.streak > 0 {
+            Color::Green
+        } else if self.stats.streak < 0 {
+            Color::Red
+        } else {
+            Color::DarkGray
+        };
+
+        let pnl_color = if self.stats.total_pnl >= 0.0 { Color::Green } else { Color::Red };
+
+        let footer_line = Line::from(vec![
+            Span::styled(" Trades: ", Style::default().fg(Color::Cyan)),
+            Span::raw(format!("{}", self.stats.total_trades)),
+            Span::styled("  Win: ", Style::default().fg(Color::Cyan)),
+            Span::raw(format!("{:.1}%", self.stats.win_rate * 100.0)),
+            Span::styled("  PnL: ", Style::default().fg(Color::Cyan)),
+            Span::styled(format!("${:+.2}", self.stats.total_pnl), Style::default().fg(pnl_color)),
+            Span::styled("  Streak: ", Style::default().fg(Color::Cyan)),
+            Span::styled(streak_str, Style::default().fg(streak_color)),
+            Span::styled("    [q] quit  [k] kill switch", Style::default().fg(Color::DarkGray)),
+        ]);
+
+        let footer = Paragraph::new(footer_line)
+            .block(Block::default().borders(Borders::ALL).border_style(Style::default().fg(Color::Cyan)));
+        frame.render_widget(footer, area);
+    }
+}
+
+fn status_color(status: AgentStatus) -> Color {
+    match status {
+        AgentStatus::Scanning => Color::DarkGray,
+        AgentStatus::SignalDetected => Color::Yellow,
+        AgentStatus::WaitingLlm => Color::Yellow,
+        AgentStatus::Executing => Color::Green,
+        AgentStatus::InPosition => Color::Green,
+        AgentStatus::SecondLook => Color::Yellow,
+        AgentStatus::Paused => Color::DarkGray,
+        AgentStatus::KillSwitch => Color::Red,
+    }
+}
+
+fn signal_level_color(level: SignalLevel) -> Color {
+    match level {
+        SignalLevel::StrongLong => Color::Magenta,
+        SignalLevel::LeanLong => Color::Yellow,
+        SignalLevel::Weak => Color::DarkGray,
+        SignalLevel::LeanShort => Color::Yellow,
+        SignalLevel::StrongShort => Color::Magenta,
+        SignalLevel::NoTrade => Color::DarkGray,
     }
 }

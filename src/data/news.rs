@@ -1,5 +1,6 @@
 use tracing::info;
 
+#[allow(dead_code)] // Phase 2 stub
 /// News feed for circuit breaker events.
 /// Phase 1: stub — will poll Cryptopanic + FRED macro calendar in Phase 2.
 pub struct NewsFeed {

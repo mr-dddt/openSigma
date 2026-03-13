@@ -15,6 +15,7 @@ impl KillSwitch {
     }
 
     /// Trigger kill switch and close all positions on both exchanges.
+    #[allow(dead_code)]
     pub async fn trigger_with_executors(
         &mut self,
         hl: &HlExecutor,
