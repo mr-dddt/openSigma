@@ -46,6 +46,7 @@ pub struct App {
     pub initial_equity: f64,
     pub equity: f64,
     pub daily_pnl: f64,
+    pub max_positions: u32,
     // Phase 3 additions
     pub positions: Vec<PositionInfo>,
     pub stats: PerformanceStats,
@@ -53,7 +54,7 @@ pub struct App {
 }
 
 impl App {
-    pub fn new(initial_equity: f64) -> Self {
+    pub fn new(initial_equity: f64, max_positions: u32) -> Self {
         Self {
             status: AgentStatus::Scanning,
             btc_price: 0.0,
@@ -62,6 +63,7 @@ impl App {
             initial_equity,
             equity: initial_equity,
             daily_pnl: 0.0,
+            max_positions,
             positions: Vec::new(),
             stats: PerformanceStats::default(),
             balances: ExchangeBalances::default(),
@@ -209,7 +211,7 @@ impl App {
     }
 
     fn render_positions(&self, frame: &mut Frame, area: Rect) {
-        let title = format!(" Positions [{}/2] ", self.positions.len());
+        let title = format!(" Positions [{}/{}] ", self.positions.len(), self.max_positions);
         let items: Vec<ListItem> = if self.positions.is_empty() {
             vec![ListItem::new(Span::styled("  No active positions", Style::default().fg(Color::DarkGray)))]
         } else {

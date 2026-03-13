@@ -704,7 +704,7 @@ async fn main() -> Result<()> {
     });
 
     // TUI on main thread
-    let mut app = App::new(initial_usd);
+    let mut app = App::new(initial_usd, config.capital.max_concurrent_positions);
 
     crossterm::terminal::enable_raw_mode()?;
     std::io::stdout().execute(crossterm::terminal::EnterAlternateScreen)?;
