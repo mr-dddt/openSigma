@@ -31,6 +31,12 @@ pub struct PerformanceStats {
     pub streak: i32,
 }
 
+#[derive(Debug, Clone, Default)]
+pub struct ExchangeBalances {
+    pub hl_equity: f64,
+    pub pm_balance: f64,
+}
+
 pub struct App {
     // State
     pub status: AgentStatus,
@@ -43,6 +49,7 @@ pub struct App {
     // Phase 3 additions
     pub positions: Vec<PositionInfo>,
     pub stats: PerformanceStats,
+    pub balances: ExchangeBalances,
 }
 
 impl App {
@@ -57,6 +64,7 @@ impl App {
             daily_pnl: 0.0,
             positions: Vec::new(),
             stats: PerformanceStats::default(),
+            balances: ExchangeBalances::default(),
         }
     }
 
@@ -85,11 +93,15 @@ impl App {
     }
 
     pub fn update_stats(&mut self, stats: PerformanceStats) {
-        self.equity = self.initial_equity + stats.total_pnl;
-        if self.initial_equity > 0.0 {
-            self.daily_pnl = (stats.total_pnl / self.initial_equity) * 100.0;
-        }
         self.stats = stats;
+    }
+
+    pub fn update_balances(&mut self, balances: ExchangeBalances) {
+        self.balances = balances;
+        self.equity = self.balances.hl_equity + self.balances.pm_balance;
+        if self.initial_equity > 0.0 {
+            self.daily_pnl = ((self.equity - self.initial_equity) / self.initial_equity) * 100.0;
+        }
     }
 
     pub fn render_frame(&self, frame: &mut Frame) {
@@ -121,22 +133,22 @@ impl App {
 
         let status_lines = vec![
             Line::from(vec![
-                Span::styled(" BTC:      ", Style::default().fg(Color::Cyan)),
+                Span::styled(" BTC:  ", Style::default().fg(Color::Cyan)),
                 Span::styled(format!("${:.2}", self.btc_price), Style::default().fg(Color::White).bold()),
+                Span::styled(format!("  [{}]", self.status), Style::default().fg(status_color(self.status))),
             ]),
             Line::from(vec![
-                Span::styled(" Status:   ", Style::default().fg(Color::Cyan)),
-                Span::styled(
-                    format!("[{}]", self.status),
-                    Style::default().fg(status_color(self.status)),
-                ),
+                Span::styled(" HL:   ", Style::default().fg(Color::Cyan)),
+                Span::styled(format!("${:.2}", self.balances.hl_equity), Style::default().fg(Color::White)),
+                Span::styled("  PM: ", Style::default().fg(Color::Cyan)),
+                Span::styled(format!("${:.2}", self.balances.pm_balance), Style::default().fg(Color::White)),
             ]),
             Line::from(vec![
-                Span::styled(" Equity:   ", Style::default().fg(Color::Cyan)),
-                Span::styled(format!("${:.2}", self.equity), Style::default().fg(Color::White)),
+                Span::styled(" Total:", Style::default().fg(Color::Cyan)),
+                Span::styled(format!(" ${:.2}", self.equity), Style::default().fg(Color::White).bold()),
             ]),
             Line::from(vec![
-                Span::styled(" Daily PnL:", Style::default().fg(Color::Cyan)),
+                Span::styled(" PnL:  ", Style::default().fg(Color::Cyan)),
                 Span::styled(
                     format!(" {pnl_sign}{:.2}%", self.daily_pnl),
                     Style::default().fg(pnl_color),

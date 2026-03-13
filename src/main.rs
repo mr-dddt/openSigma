@@ -35,7 +35,7 @@ use crate::journal::reporter::Reporter;
 use crate::signals::aggregator::SignalAggregator;
 use crate::signals::indicators::Indicators;
 use crate::telegram::TelegramClient;
-use crate::tui::app::{App, PerformanceStats, PositionInfo};
+use crate::tui::app::{App, ExchangeBalances, PerformanceStats, PositionInfo};
 use crate::types::*;
 
 const TUNE_SYSTEM_PROMPT: &str = r#"You are openSigma's signal engine tuner. Analyze the recent trade history and current signal parameters, then suggest parameter adjustments to improve performance.
@@ -67,6 +67,7 @@ enum TuiUpdate {
     Log(String),
     Positions(Vec<PositionInfo>),
     Stats(PerformanceStats),
+    Balances(ExchangeBalances),
 }
 
 #[tokio::main]
@@ -192,6 +193,31 @@ async fn main() -> Result<()> {
     let (tui_tx, mut tui_rx) = mpsc::channel::<TuiUpdate>(256);
     let tui_tx_clone = tui_tx.clone();
     let config_for_engine = shared_config.clone();
+
+    // Spawn balance poller (queries HL + PM every 30s)
+    {
+        let tui_tx_bal = tui_tx.clone();
+        let hl_key = secrets.hl_private_key.clone();
+        let pm_api_key = secrets.pm_api_key.clone();
+        let pm_api_secret = secrets.pm_api_secret.clone();
+        let pm_passphrase = secrets.pm_passphrase.clone();
+        tokio::spawn(async move {
+            let mut interval = tokio::time::interval(tokio::time::Duration::from_secs(30));
+            let pm = PmExecutor::new(&pm_api_key, &pm_api_secret, &pm_passphrase);
+            loop {
+                interval.tick().await;
+                let hl_eq = match HlExecutor::new(&hl_key).await {
+                    Ok(hl) => hl.account_equity().await.unwrap_or(0.0),
+                    Err(_) => 0.0,
+                };
+                let pm_bal = pm.account_balance().await.unwrap_or(0.0);
+                let _ = tui_tx_bal.send(TuiUpdate::Balances(ExchangeBalances {
+                    hl_equity: hl_eq,
+                    pm_balance: pm_bal,
+                })).await;
+            }
+        });
+    }
 
     // Spawn the market event processor + signal engine + LLM gate
     tokio::spawn(async move {
@@ -542,6 +568,7 @@ async fn main() -> Result<()> {
                 TuiUpdate::Log(l) => app.push_log(l),
                 TuiUpdate::Positions(p) => app.update_positions(p),
                 TuiUpdate::Stats(s) => app.update_stats(s),
+                TuiUpdate::Balances(b) => app.update_balances(b),
             }
         }
 

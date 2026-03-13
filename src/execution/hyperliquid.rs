@@ -163,6 +163,25 @@ impl HlExecutor {
         Ok(positions)
     }
 
+    /// Query account equity (total USDC value including margin + unrealized PnL).
+    pub async fn account_equity(&self) -> Result<f64> {
+        let info = InfoClient::new(None, Some(BaseUrl::Mainnet))
+            .await
+            .map_err(|e| anyhow::anyhow!("Failed to create InfoClient: {e:?}"))?;
+
+        let state = info
+            .user_state(self.wallet.address())
+            .await
+            .map_err(|e| anyhow::anyhow!("Failed to query user state: {e:?}"))?;
+
+        let equity: f64 = state
+            .margin_summary
+            .account_value
+            .parse()
+            .unwrap_or(0.0);
+        Ok(equity)
+    }
+
     /// Close all positions (market sell/buy to flatten).
     pub async fn close_all(&self) -> Result<()> {
         let positions = self.positions().await?;

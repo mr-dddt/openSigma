@@ -49,6 +49,32 @@ impl PmExecutor {
         }
     }
 
+    /// Query USDC balance on Polymarket (Polygon).
+    pub async fn account_balance(&self) -> Result<f64> {
+        if self.api_key.is_empty() {
+            return Ok(0.0);
+        }
+        let resp = self
+            .client
+            .get(format!("{}/balance", PM_CLOB_URL))
+            .header("POLY_API_KEY", &self.api_key)
+            .header("POLY_API_SECRET", &self.api_secret)
+            .header("POLY_PASSPHRASE", &self.passphrase)
+            .send()
+            .await
+            .context("Failed to query PM balance")?;
+
+        if resp.status().is_success() {
+            let body: serde_json::Value = resp.json().await.unwrap_or_default();
+            Ok(body.get("balance")
+                .and_then(|v| v.as_str())
+                .and_then(|s| s.parse::<f64>().ok())
+                .unwrap_or(0.0))
+        } else {
+            Ok(0.0)
+        }
+    }
+
     /// Place a maker limit order on a binary market.
     pub async fn place_limit_order(
         &self,
