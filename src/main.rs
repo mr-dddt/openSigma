@@ -21,7 +21,7 @@ use crate::agent::llm_gate::LlmGate;
 use crate::agent::second_look::SecondLookScheduler;
 use crate::agent::tuner::{SignalTuner, TuneTrigger};
 use crate::config::{Config, Secrets};
-use crate::data::hyperliquid::HyperliquidFeed;
+use crate::data::hyperliquid::{self, HyperliquidFeed};
 use crate::data::news::NewsFeed;
 use crate::data::polymarket::PolymarketFeed;
 use crate::execution::hyperliquid::HlExecutor;
@@ -114,6 +114,32 @@ async fn main() -> Result<()> {
 
     // Initialize components
     let mut aggregator = SignalAggregator::new();
+
+    // Pre-load historical candles to eliminate warm-up delay.
+    // 200 x 1m candles and 200 x 5m candles give all indicators
+    // full history from the first tick.
+    info!("Loading historical candles from Hyperliquid...");
+    match hyperliquid::fetch_historical_candles("BTC", "1m", 200).await {
+        Ok(candles) => {
+            let count = candles.len();
+            for c in candles {
+                aggregator.indicators.push_candle_1m(c);
+            }
+            info!(count, "1m candles loaded — EMA, StochRSI ready");
+        }
+        Err(e) => warn!("Failed to load 1m candles (will warm up from live): {e:#}"),
+    }
+    match hyperliquid::fetch_historical_candles("BTC", "5m", 200).await {
+        Ok(candles) => {
+            let count = candles.len();
+            for c in candles {
+                aggregator.indicators.push_candle_5m(c);
+            }
+            info!(count, "5m candles loaded — RSI, ATR, BB ready");
+        }
+        Err(e) => warn!("Failed to load 5m candles (will warm up from live): {e:#}"),
+    }
+
     let memory = Arc::new(MemoryManager::new("memory/memory.md"));
     let journal = TradeLogger::new("data/journal.jsonl");
 

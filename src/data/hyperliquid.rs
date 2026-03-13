@@ -1,4 +1,4 @@
-use anyhow::Result;
+use anyhow::{Context, Result};
 use chrono::Utc;
 use futures_util::{SinkExt, StreamExt};
 use serde::Deserialize;
@@ -256,6 +256,7 @@ enum AllMidsChannel {
 
 // Actually, let's use a simpler approach with a raw Value first:
 
+use chrono::TimeZone;
 use std::collections::HashMap;
 
 #[derive(Debug, Deserialize)]
@@ -338,4 +339,96 @@ struct ActiveAssetCtxData {
 #[derive(Debug, Deserialize)]
 struct AssetCtx {
     funding: Option<String>,
+}
+
+// ---------------------------------------------------------------------------
+// Historical candle snapshot (REST API) — eliminates warm-up delay
+// ---------------------------------------------------------------------------
+
+const HL_INFO_URL: &str = "https://api.hyperliquid.xyz/info";
+
+#[derive(Debug, Deserialize)]
+struct HlCandleRaw {
+    #[serde(rename = "t")]
+    timestamp_ms: u64,
+    #[serde(rename = "o")]
+    open: String,
+    #[serde(rename = "h")]
+    high: String,
+    #[serde(rename = "l")]
+    low: String,
+    #[serde(rename = "c")]
+    close: String,
+    #[serde(rename = "v")]
+    volume: String,
+}
+
+/// Fetch historical candles from Hyperliquid's REST API.
+/// Returns parsed Candle structs sorted oldest-first, ready to push
+/// into Indicators.
+pub async fn fetch_historical_candles(
+    coin: &str,
+    interval: &str,
+    count: usize,
+) -> Result<Vec<Candle>> {
+    let client = reqwest::Client::new();
+
+    let now_ms = Utc::now().timestamp_millis() as u64;
+    let interval_ms: u64 = match interval {
+        "1m" => 60_000,
+        "5m" => 300_000,
+        _ => 60_000,
+    };
+    let start_ms = now_ms - (count as u64 * interval_ms);
+
+    let body = serde_json::json!({
+        "type": "candleSnapshot",
+        "req": {
+            "coin": coin,
+            "interval": interval,
+            "startTime": start_ms,
+            "endTime": now_ms
+        }
+    });
+
+    let resp = client
+        .post(HL_INFO_URL)
+        .json(&body)
+        .send()
+        .await
+        .context("Failed to fetch HL historical candles")?;
+
+    let status = resp.status();
+    if !status.is_success() {
+        let text: String = resp.text().await.unwrap_or_default();
+        anyhow::bail!("HL candle API returned {status}: {text}");
+    }
+
+    let raw: Vec<HlCandleRaw> = resp
+        .json::<Vec<HlCandleRaw>>()
+        .await
+        .context("Failed to parse HL candle response")?;
+
+    let candles: Vec<Candle> = raw
+        .into_iter()
+        .filter_map(|c| {
+            Some(Candle {
+                open: c.open.parse().ok()?,
+                high: c.high.parse().ok()?,
+                low: c.low.parse().ok()?,
+                close: c.close.parse().ok()?,
+                volume: c.volume.parse().ok()?,
+                timestamp: Utc.timestamp_millis_opt(c.timestamp_ms as i64).single()?,
+            })
+        })
+        .collect();
+
+    info!(
+        coin = coin,
+        interval = interval,
+        fetched = candles.len(),
+        "Historical candles loaded"
+    );
+
+    Ok(candles)
 }
