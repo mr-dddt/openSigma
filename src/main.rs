@@ -309,8 +309,12 @@ async fn main() -> Result<()> {
         });
     }
 
+    // Shutdown channel: when user presses 'k', we signal engine to close positions and exit
+    let (shutdown_tx, mut shutdown_rx) = mpsc::channel::<()>(1);
+    let shutdown_tx_for_tui = shutdown_tx.clone();
+
     // Spawn the market event processor + signal engine + LLM gate
-    tokio::spawn(async move {
+    let engine_handle = tokio::spawn(async move {
         const LLM_SKIP_COOLDOWN_SECS: i64 = 20;
         const LLM_EXECUTE_COOLDOWN_SECS: i64 = 45;
         let mut llm_cooldown_until: Option<chrono::DateTime<chrono::Utc>> = None;
@@ -507,7 +511,8 @@ async fn main() -> Result<()> {
                             risk.sync_balance(real_bal);
                         }
                         let hl_pos_count = hl_positions_for_engine.read().await.len() as u32;
-                        risk.set_open_positions(hl_pos_count, &cfg);
+                        let pos_count = position_monitor.open_count().max(hl_pos_count);
+                        risk.set_open_positions(pos_count, &cfg);
                         risk.maybe_reset_day();
                     }
 
@@ -656,6 +661,19 @@ async fn main() -> Result<()> {
                         }
                     }
                 }
+                _ = shutdown_rx.recv() => {
+                    info!("User kill switch — closing all HL positions before exit");
+                    if let Some(ref hl) = hl_executor {
+                        if let Err(e) = hl.close_all().await {
+                            error!("Failed to close positions on user kill: {e:#}");
+                        }
+                    }
+                    let _ = tui_tx_clone.send(TuiUpdate::Log(format!(
+                        "[{}] User kill — positions closed, shutting down",
+                        chrono::Utc::now().format("%H:%M:%S"),
+                    ))).await;
+                    break;
+                }
                 else => break,
             }
         }
@@ -671,6 +689,7 @@ async fn main() -> Result<()> {
 
     info!("All components initialized — entering main loop");
 
+    let mut user_kill = false;
     loop {
         while let Ok(update) = tui_rx.try_recv() {
             match update {
@@ -694,6 +713,8 @@ async fn main() -> Result<()> {
                         crossterm::event::KeyCode::Char('q') => break,
                         crossterm::event::KeyCode::Char('k') => {
                             error!("KILL SWITCH activated by user");
+                            let _ = shutdown_tx_for_tui.try_send(());
+                            user_kill = true;
                             break;
                         }
                         _ => {}
@@ -705,6 +726,13 @@ async fn main() -> Result<()> {
 
     crossterm::terminal::disable_raw_mode()?;
     std::io::stdout().execute(crossterm::terminal::LeaveAlternateScreen)?;
+
+    // If user pressed 'k', engine was signaled to close positions — wait for it to finish
+    if user_kill {
+        if let Err(e) = engine_handle.await {
+            warn!("Engine task join error: {e:#}");
+        }
+    }
     info!("openSigma v1 shutting down");
     Ok(())
 }
@@ -798,7 +826,8 @@ async fn handle_llm_decision(
                 risk.set_open_positions(position_monitor.open_count(), config);
             }
 
-            let size_usd = risk.max_trade_usd(config) * (size_pct / config.capital.max_trade_pct);
+            let (_in_session, size_mult) = config.active_session();
+            let size_usd = risk.max_trade_usd(config) * (size_pct / config.capital.max_trade_pct) * size_mult;
             let leverage = hl_leverage.unwrap_or(1);
 
             info!(
@@ -814,7 +843,8 @@ async fn handle_llm_decision(
                 // size_usd is margin; notional = margin × leverage
                 // HL requires minimum $10 notional per order
                 let notional = (size_usd * leverage as f64).max(10.5);
-                let sz_coin = notional / snapshot.indicators.ema_9.unwrap_or(80000.0);
+                let price = if latest_price > 0.0 { latest_price } else { snapshot.indicators.ema_9.unwrap_or(80000.0) };
+                let sz_coin = notional / price;
                 match hl.market_order("BTC", is_buy, sz_coin, leverage).await {
                     Ok(result) => {
                         if result.success {
@@ -875,7 +905,7 @@ async fn handle_llm_decision(
             risk.set_open_positions(position_monitor.open_count(), config);
             risk.record_trade_open();
 
-            // Journal the open trade
+            // Journal the open trade (size_usd = notional for consistency)
             let open_record = TradeRecord {
                 id: trade_id,
                 ts_open: trade_opened_at,
@@ -887,7 +917,7 @@ async fn handle_llm_decision(
                 signal_score: snapshot.net_score,
                 entry_price,
                 exit_price: None,
-                size_usd,
+                size_usd: notional_usd,
                 leverage: Some(leverage),
                 pnl_usd: None,
                 exit_reason: None,
@@ -896,21 +926,21 @@ async fn handle_llm_decision(
             };
             let _ = journal.log_entry(&open_record);
 
-            // Telegram alert on trade open
+            // Telegram alert on trade open (notional for consistency)
             if let Some(ref tg) = telegram {
                 let tg_ref = tg.clone();
                 let pt = *play_type;
                 let dir = *direction;
                 let reason = reasoning.clone();
                 tokio::spawn(async move {
-                    tg_ref.send_trade_open(pt, dir, size_usd, entry_price, leverage, &reason).await;
+                    tg_ref.send_trade_open(pt, dir, notional_usd, entry_price, leverage, &reason).await;
                 });
             }
 
             let _ = tui_tx.send(TuiUpdate::Log(format!(
                 "[{}] EXECUTE {} {} ${:.0} @{:.0} lev={} — {}",
                 chrono::Utc::now().format("%H:%M:%S"),
-                play_type, direction, size_usd, entry_price, leverage,
+                play_type, direction, notional_usd, entry_price, leverage,
                 reasoning,
             ))).await;
         }

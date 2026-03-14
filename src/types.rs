@@ -9,34 +9,17 @@ use uuid::Uuid;
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub enum Symbol {
     BTC,
-    ETH,
-    SOL,
-    HYPE,
-    #[serde(rename = "CL-USDC")]
-    ClUsdc,
 }
 
 impl Symbol {
-    /// Coin string as used by Hyperliquid APIs.
     pub fn hl_coin(&self) -> &'static str {
-        match self {
-            Symbol::BTC => "BTC",
-            Symbol::ETH => "ETH",
-            Symbol::SOL => "SOL",
-            Symbol::HYPE => "HYPE",
-            Symbol::ClUsdc => "CL/USDC",
-        }
-    }
-
-    /// All tradeable symbols.
-    pub fn all() -> &'static [Symbol] {
-        &[Symbol::BTC, Symbol::ETH, Symbol::SOL, Symbol::HYPE, Symbol::ClUsdc]
+        "BTC"
     }
 }
 
 impl std::fmt::Display for Symbol {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "{}", self.hl_coin())
+        write!(f, "BTC")
     }
 }
 

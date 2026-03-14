@@ -132,6 +132,9 @@ impl RiskChecker {
             ..
         } = decision
         {
+            if *size_pct <= 0.0 {
+                return Err("LLM size must be positive".to_string());
+            }
             if *size_pct > config.capital.max_trade_pct {
                 return Err(format!(
                     "LLM size {:.1}% exceeds max {:.1}%",
@@ -139,6 +142,9 @@ impl RiskChecker {
                 ));
             }
             if let Some(lev) = hl_leverage {
+                if *lev == 0 {
+                    return Err("LLM leverage cannot be 0".to_string());
+                }
                 if *lev > config.hyperliquid.max_leverage {
                     return Err(format!(
                         "LLM leverage {} exceeds max {}",
