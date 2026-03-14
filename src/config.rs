@@ -1,6 +1,7 @@
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
+use tracing::{info, warn};
 
 /// Secrets loaded from .env
 #[derive(Debug, Clone)]
@@ -164,5 +165,30 @@ impl Config {
             }
         }
         (false, 0.3) // off-session: reduced size, not blocked
+    }
+
+    /// Load tuned signal params from a separate file, overriding config.toml defaults.
+    /// Silently skips if the file doesn't exist.
+    pub fn load_tuned_signals(&mut self, path: &str) {
+        match std::fs::read_to_string(path) {
+            Ok(content) => match toml::from_str::<SignalConfig>(&content) {
+                Ok(tuned) => {
+                    info!(path = path, "Loaded tuned signal params");
+                    self.signals = tuned;
+                }
+                Err(e) => warn!("Failed to parse tuned signals from {path}: {e}"),
+            },
+            Err(_) => {} // File doesn't exist yet, use config.toml defaults
+        }
+    }
+
+    /// Save current signal params to a separate file for persistence across restarts.
+    pub fn save_signals(&self, path: &str) -> Result<()> {
+        let content = toml::to_string_pretty(&self.signals)
+            .context("Failed to serialize signal config")?;
+        std::fs::write(path, &content)
+            .with_context(|| format!("Failed to write tuned signals to {path}"))?;
+        info!(path = path, "Saved tuned signal params");
+        Ok(())
     }
 }

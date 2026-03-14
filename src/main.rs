@@ -87,7 +87,8 @@ async fn main() -> Result<()> {
     info!("openSigma v1 starting...");
 
     // Load config (shared via Arc<RwLock> for tuner writes)
-    let config = Config::load("config.toml")?;
+    let mut config = Config::load("config.toml")?;
+    config.load_tuned_signals("data/tuned_signals.toml");
     let secrets = Secrets::from_env()?;
 
     info!(
@@ -194,6 +195,15 @@ async fn main() -> Result<()> {
     };
     let mut risk = RiskChecker::new(initial_usd);
 
+    // Restore stats from journal history
+    match journal.read_all_closed() {
+        Ok(trades) if !trades.is_empty() => {
+            risk.restore_from_trades(&trades);
+        }
+        Err(e) => warn!("Failed to read journal for stats restoration: {e:#}"),
+        _ => {}
+    }
+
     // Startup reconciliation: detect positions left open from previous run.
     // Uses ATR-based TP/SL if available, otherwise defaults to 0.2%/0.3%.
     let recovered_sl = aggregator.indicators.atr_pct(71000.0)
@@ -245,6 +255,16 @@ async fn main() -> Result<()> {
     // TUI update channel
     let (tui_tx, mut tui_rx) = mpsc::channel::<TuiUpdate>(256);
     let tui_tx_clone = tui_tx.clone();
+
+    // Send initial stats from journal history so TUI shows correct values on startup
+    if risk.total_closed() > 0 {
+        let _ = tui_tx.try_send(TuiUpdate::Stats(PerformanceStats {
+            total_trades: risk.total_closed(),
+            win_rate: risk.win_rate(),
+            total_pnl: risk.current_equity() - initial_usd,
+            streak: risk.streak(),
+        }));
+    }
     let config_for_engine = shared_config.clone();
 
     // Shared state — updated by poller, read by engine for risk + LLM context
@@ -602,6 +622,9 @@ async fn main() -> Result<()> {
                             Ok(tune_decision) => {
                                 let mut cfg_write = config_for_engine.write().await;
                                 tuner.apply_tune(&mut cfg_write, &tune_decision);
+                                if let Err(e) = cfg_write.save_signals("data/tuned_signals.toml") {
+                                    warn!("Failed to persist tuned signals: {e:#}");
+                                }
                                 let _ = tui_tx_clone.send(TuiUpdate::Log(format!(
                                     "[{}] Signal engine tuned: {}",
                                     chrono::Utc::now().format("%H:%M:%S"),
@@ -680,7 +703,7 @@ async fn main() -> Result<()> {
     });
 
     // TUI on main thread
-    let mut app = App::new(initial_usd, config.capital.max_concurrent_positions);
+    let mut app = App::new(initial_usd, config.capital.initial_usd, config.capital.max_concurrent_positions);
 
     crossterm::terminal::enable_raw_mode()?;
     std::io::stdout().execute(crossterm::terminal::EnterAlternateScreen)?;

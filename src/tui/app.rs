@@ -1,11 +1,36 @@
+use chrono::{Datelike, Utc};
 use ratatui::{
     prelude::{Color, Constraint, Frame, Layout, Line, Rect, Span, Style, Stylize},
     widgets::{Block, Borders, List, ListItem, Paragraph},
 };
+use serde::{Deserialize, Serialize};
 
 use crate::types::{
     AgentStatus, Direction, SignalLevel, SignalSnapshot,
 };
+
+const DAILY_STATE_PATH: &str = "data/daily_state.json";
+
+#[derive(Serialize, Deserialize)]
+struct DailyState {
+    date: String,
+    start_equity: f64,
+}
+
+fn load_daily_state() -> Option<DailyState> {
+    let content = std::fs::read_to_string(DAILY_STATE_PATH).ok()?;
+    serde_json::from_str(&content).ok()
+}
+
+fn save_daily_state(equity: f64) {
+    let state = DailyState {
+        date: Utc::now().format("%Y-%m-%d").to_string(),
+        start_equity: equity,
+    };
+    if let Ok(json) = serde_json::to_string_pretty(&state) {
+        let _ = std::fs::write(DAILY_STATE_PATH, json);
+    }
+}
 
 // TUI-specific display types — sourced from HL queries, not internal calculations
 
@@ -39,9 +64,14 @@ pub struct App {
     pub btc_price: f64,
     pub latest_signal: Option<SignalSnapshot>,
     pub trade_log: Vec<String>,
+    #[allow(dead_code)]
     pub initial_equity: f64,
+    pub config_initial_usd: f64,
     pub equity: f64,
-    pub daily_pnl: f64,
+    pub total_pnl_pct: f64,
+    pub daily_pnl_pct: f64,
+    start_of_day_equity: f64,
+    current_day: u32,
     pub max_positions: u32,
     // Phase 3 additions
     pub positions: Vec<PositionInfo>,
@@ -50,15 +80,29 @@ pub struct App {
 }
 
 impl App {
-    pub fn new(initial_equity: f64, max_positions: u32) -> Self {
+    pub fn new(initial_equity: f64, config_initial_usd: f64, max_positions: u32) -> Self {
+        let today = Utc::now().ordinal();
+        let start_of_day_equity = match load_daily_state() {
+            Some(state) if state.date == Utc::now().format("%Y-%m-%d").to_string() => {
+                state.start_equity
+            }
+            _ => {
+                save_daily_state(initial_equity);
+                initial_equity
+            }
+        };
         Self {
             status: AgentStatus::Scanning,
             btc_price: 0.0,
             latest_signal: None,
             trade_log: Vec::new(),
             initial_equity,
+            config_initial_usd,
             equity: initial_equity,
-            daily_pnl: 0.0,
+            total_pnl_pct: 0.0,
+            daily_pnl_pct: 0.0,
+            start_of_day_equity,
+            current_day: today,
             max_positions,
             positions: Vec::new(),
             stats: PerformanceStats::default(),
@@ -97,8 +141,19 @@ impl App {
     pub fn update_balances(&mut self, balances: ExchangeBalances) {
         self.balances = balances;
         self.equity = self.balances.hl_equity;
-        if self.initial_equity > 0.0 {
-            self.daily_pnl = ((self.equity - self.initial_equity) / self.initial_equity) * 100.0;
+        // Total PnL since inception (based on original capital from config)
+        if self.config_initial_usd > 0.0 {
+            self.total_pnl_pct = ((self.equity - self.config_initial_usd) / self.config_initial_usd) * 100.0;
+        }
+        // Daily PnL (reset at UTC midnight, persisted to disk)
+        let today = Utc::now().ordinal();
+        if today != self.current_day {
+            self.start_of_day_equity = self.equity;
+            self.current_day = today;
+            save_daily_state(self.equity);
+        }
+        if self.start_of_day_equity > 0.0 {
+            self.daily_pnl_pct = ((self.equity - self.start_of_day_equity) / self.start_of_day_equity) * 100.0;
         }
     }
 
@@ -127,8 +182,8 @@ impl App {
             .split(area);
 
         // Left: portfolio info
-        let pnl_color = if self.daily_pnl >= 0.0 { Color::Green } else { Color::Red };
-        let pnl_sign = if self.daily_pnl >= 0.0 { "+" } else { "" };
+        let total_pnl_color = if self.total_pnl_pct >= 0.0 { Color::Green } else { Color::Red };
+        let daily_pnl_color = if self.daily_pnl_pct >= 0.0 { Color::Green } else { Color::Red };
 
         let status_lines = vec![
             Line::from(vec![
@@ -149,8 +204,13 @@ impl App {
             Line::from(vec![
                 Span::styled(" PnL:  ", Style::default().fg(Color::Cyan)),
                 Span::styled(
-                    format!(" {pnl_sign}{:.2}%", self.daily_pnl),
-                    Style::default().fg(pnl_color),
+                    format!(" {:+.2}%", self.total_pnl_pct),
+                    Style::default().fg(total_pnl_color),
+                ),
+                Span::styled("  Today:", Style::default().fg(Color::Cyan)),
+                Span::styled(
+                    format!(" {:+.2}%", self.daily_pnl_pct),
+                    Style::default().fg(daily_pnl_color),
                 ),
             ]),
         ];

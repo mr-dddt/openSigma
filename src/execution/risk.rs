@@ -1,8 +1,8 @@
 use chrono::{DateTime, Datelike, Utc};
 
 use crate::config::Config;
-use crate::types::LlmDecision;
-use tracing::warn;
+use crate::types::{LlmDecision, TradeRecord};
+use tracing::{info, warn};
 
 const TRADE_COOLDOWN_SECS: i64 = 30;
 
@@ -236,4 +236,27 @@ impl RiskChecker {
         self.daily_loss_usd
     }
 
+    /// Restore win/loss stats from historical journal trades on startup.
+    /// Does NOT modify equity (that comes from exchange balance sync).
+    pub fn restore_from_trades(&mut self, trades: &[TradeRecord]) {
+        for t in trades {
+            if let Some(pnl) = t.pnl_usd {
+                self.total_closed += 1;
+                if pnl >= 0.0 {
+                    self.total_wins += 1;
+                    self.streak = if self.streak >= 0 { self.streak + 1 } else { 1 };
+                } else {
+                    self.streak = if self.streak <= 0 { self.streak - 1 } else { -1 };
+                }
+            }
+        }
+        if self.total_closed > 0 {
+            info!(
+                total = self.total_closed,
+                wins = self.total_wins,
+                streak = self.streak,
+                "Restored stats from journal"
+            );
+        }
+    }
 }

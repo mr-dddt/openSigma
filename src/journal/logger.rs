@@ -45,7 +45,7 @@ impl TradeLogger {
         };
 
         let reader = BufReader::new(file);
-        let all_lines: Vec<String> = reader.lines().filter_map(|l| l.ok()).collect();
+        let all_lines: Vec<String> = reader.lines().map_while(Result::ok).collect();
 
         let mut records: Vec<TradeRecord> = all_lines
             .iter()
@@ -55,6 +55,24 @@ impl TradeLogger {
             .take(n)
             .collect();
         records.reverse();
+
+        Ok(records)
+    }
+
+    /// Read all closed trade records (for startup stats restoration).
+    pub fn read_all_closed(&self) -> Result<Vec<TradeRecord>> {
+        let file = match std::fs::File::open(&self.path) {
+            Ok(f) => f,
+            Err(_) => return Ok(vec![]),
+        };
+
+        let reader = BufReader::new(file);
+        let records: Vec<TradeRecord> = reader
+            .lines()
+            .map_while(Result::ok)
+            .filter_map(|line| serde_json::from_str::<TradeRecord>(&line).ok())
+            .filter(|r| r.ts_close.is_some())
+            .collect();
 
         Ok(records)
     }
