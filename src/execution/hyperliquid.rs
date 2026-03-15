@@ -38,25 +38,19 @@ pub async fn query_account_state(wallet_address: ethers::types::Address) -> Resu
         })
         .collect();
 
-    let unrealized_pnl: f64 = positions.iter().map(|p| p.unrealized_pnl).sum();
+    // Use HL's own account_value from margin_summary — already includes
+    // unrealized PnL. Do NOT manually add spot + unrealized_pnl, because
+    // for isolated positions margin already includes unrealized PnL and
+    // spot_total reflects that, causing double-counting.
+    let total_equity = state.margin_summary.account_value
+        .parse::<f64>()
+        .unwrap_or(0.0);
 
-    // Spot clearinghouse: total USDC and available (total - hold).
-    // On unified accounts, all USDC lives in spot — perp withdrawable is 0.
-    let (spot_total, spot_available) = match info.user_token_balances(wallet_address).await {
-        Ok(balances) => {
-            let usdc = balances.balances.iter().find(|b| b.coin == "USDC");
-            let total = usdc.and_then(|b| b.total.parse::<f64>().ok()).unwrap_or(0.0);
-            let hold = usdc.and_then(|b| b.hold.parse::<f64>().ok()).unwrap_or(0.0);
-            (total, total - hold)
-        }
-        Err(e) => {
-            warn!("Failed to query spot balances: {e:?}");
-            (0.0, 0.0)
-        }
-    };
+    let withdrawable = state.withdrawable
+        .parse::<f64>()
+        .unwrap_or(0.0);
 
-    let total_equity = spot_total + unrealized_pnl;
-    Ok((total_equity, spot_available, positions))
+    Ok((total_equity, withdrawable, positions))
 }
 
 /// Hyperliquid order executor — uses the official SDK for proper EIP-712 signing.
@@ -217,44 +211,23 @@ impl HlExecutor {
 
     /// Query total account equity: perp clearinghouse + spot USDC balance.
     /// Unified accounts keep most USDC in the spot clearinghouse while using
-    /// it as perp collateral, so we must query both.
+    /// Total account equity from HL's margin_summary.account_value.
+    /// This already includes unrealized PnL — no manual addition needed.
     pub async fn account_equity(&self) -> Result<f64> {
         let info = InfoClient::new(None, Some(BaseUrl::Mainnet))
             .await
             .map_err(|e| anyhow::anyhow!("Failed to create InfoClient: {e:?}"))?;
 
-        // Perp clearinghouse: margin + unrealized PnL
-        // Unrealized PnL from perp positions
-        let unrealized_pnl = match info.user_state(self.wallet.address()).await {
-            Ok(state) => state
-                .asset_positions
-                .iter()
-                .map(|p| p.position.unrealized_pnl.parse::<f64>().unwrap_or(0.0))
-                .sum::<f64>(),
-            Err(e) => {
-                warn!("Failed to query perp state: {e:?}");
-                0.0
-            }
-        };
+        let state = info.user_state(self.wallet.address())
+            .await
+            .map_err(|e| anyhow::anyhow!("Failed to query user state: {e:?}"))?;
 
-        // Spot clearinghouse: USDC balance (unified accounts store all funds here,
-        // including margin allocated to perps — so don't add perp accountValue)
-        let spot_usdc = match info.user_token_balances(self.wallet.address()).await {
-            Ok(balances) => balances
-                .balances
-                .iter()
-                .find(|b| b.coin == "USDC")
-                .and_then(|b| b.total.parse::<f64>().ok())
-                .unwrap_or(0.0),
-            Err(e) => {
-                warn!("Failed to query spot balances: {e:?}");
-                0.0
-            }
-        };
+        let equity = state.margin_summary.account_value
+            .parse::<f64>()
+            .unwrap_or(0.0);
 
-        let total = spot_usdc + unrealized_pnl;
-        info!(spot_usdc, unrealized_pnl, total, "HL account equity");
-        Ok(total)
+        info!(equity, "HL account equity");
+        Ok(equity)
     }
 
     /// Close all positions (market sell/buy to flatten).
