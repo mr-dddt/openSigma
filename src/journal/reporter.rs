@@ -624,6 +624,12 @@ pub fn apply_param_adjustments(config: &mut crate::config::Config, adjustments: 
     if config.signals.strong_threshold < config.signals.lean_threshold {
         config.signals.strong_threshold = config.signals.lean_threshold;
     }
+    // Keep triggerability bounds consistent with tuner guardrails.
+    config.signals.lean_threshold = config.signals.lean_threshold.clamp(2, 4);
+    config.signals.strong_threshold = config.signals.strong_threshold.clamp(4, 6);
+    if config.signals.strong_threshold <= config.signals.lean_threshold {
+        config.signals.strong_threshold = (config.signals.lean_threshold + 1).min(6);
+    }
     if config.signals.rsi_oversold > config.signals.rsi_overbought {
         config.signals.rsi_oversold = config.signals.rsi_overbought;
     }

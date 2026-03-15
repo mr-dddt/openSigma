@@ -386,4 +386,54 @@ impl Indicators {
             1.0
         }
     }
+
+    /// Summarize recent 1m price movement for regime-aware tuning context.
+    pub fn recent_price_movement_summary(&self, minutes: usize) -> String {
+        if minutes < 2 || self.candles_1m.len() < minutes {
+            return "Price movement: n/a (insufficient 1m candles)".to_string();
+        }
+        let recent: Vec<&Candle> = self.candles_1m.iter().rev().take(minutes).collect();
+        let first = *recent.last().unwrap_or(&recent[0]);
+        let last = recent[0];
+
+        if first.close <= 0.0 || last.close <= 0.0 {
+            return "Price movement: n/a (invalid candle data)".to_string();
+        }
+
+        let ret_pct = ((last.close - first.close) / first.close) * 100.0;
+        let hi = recent.iter().map(|c| c.high).fold(f64::MIN, f64::max);
+        let lo = recent.iter().map(|c| c.low).fold(f64::MAX, f64::min);
+        let range_pct = if first.close > 0.0 {
+            ((hi - lo) / first.close) * 100.0
+        } else {
+            0.0
+        };
+        let avg_body_pct = recent
+            .iter()
+            .map(|c| ((c.close - c.open).abs() / c.open.max(1.0)) * 100.0)
+            .sum::<f64>()
+            / minutes as f64;
+
+        let bars = recent
+            .iter()
+            .rev()
+            .take(6)
+            .map(|c| {
+                format!(
+                    "{} o={:.0} h={:.0} l={:.0} c={:.0}",
+                    c.timestamp.format("%H:%M"),
+                    c.open,
+                    c.high,
+                    c.low,
+                    c.close
+                )
+            })
+            .collect::<Vec<_>>()
+            .join(" | ");
+
+        format!(
+            "Recent 1m movement ({}m): ret={:+.3}% range={:.3}% avg_body={:.3}%\nLast candles: {}",
+            minutes, ret_pct, range_pct, avg_body_pct, bars
+        )
+    }
 }

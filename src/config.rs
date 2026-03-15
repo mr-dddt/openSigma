@@ -149,7 +149,7 @@ pub struct TuningConfig {
     pub inactivity_timeout_secs: u64,
 }
 
-fn default_tune_trades() -> u64 { 20 }
+fn default_tune_trades() -> u64 { 5 }
 fn default_inactivity() -> u64 { 600 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -167,7 +167,7 @@ impl Default for TelegramConfig {
 impl Default for TuningConfig {
     fn default() -> Self {
         Self {
-            tune_every_n_trades: 20,
+            tune_every_n_trades: 5,
             inactivity_timeout_secs: 600,
         }
     }

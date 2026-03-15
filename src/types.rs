@@ -223,6 +223,8 @@ pub enum LlmDecision {
 pub struct TuneDecision {
     pub adjustments: Vec<TuneAdjustment>,
     pub reasoning: String,
+    #[serde(default)]
+    pub strategy_pattern: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

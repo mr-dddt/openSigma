@@ -40,7 +40,7 @@ use crate::types::*;
 const TUNE_SYSTEM_PROMPT: &str = r#"You are openSigma's signal engine tuner. Analyze the recent trade history and current signal parameters, then suggest parameter adjustments to improve performance.
 
 Respond with ONLY a valid JSON object:
-{"adjustments":[{"param":"<name>","old_value":<current>,"new_value":<suggested>}],"reasoning":"..."}
+{"adjustments":[{"param":"<name>","old_value":<current>,"new_value":<suggested>}],"reasoning":"...","strategy_pattern":"optional short pattern idea for current regime"}
 
 Tunable parameters:
 - ema_cross_weight (int, weight for EMA 9/21 crossover signal)
@@ -60,6 +60,8 @@ Rules:
 - Only suggest changes you are confident will improve performance
 - Provide clear reasoning based on the trade data
 - Keep adjustments small and conservative
+- Use the recent price movement block (last minutes) to adapt to regime shifts.
+- If you detect a regime shift, put a short actionable pattern in `strategy_pattern` (else empty string).
 - If no changes needed, return empty adjustments array"#;
 
 enum TuiUpdate {
@@ -489,6 +491,7 @@ async fn main() -> Result<()> {
 
                     // Check position expirations (max hold time)
                     let expired = position_monitor.check_expirations();
+                    let mut any_expired_closed = false;
                     for id in expired {
                         if let Some(trade_snapshot) = position_monitor.get_trade(&id) {
                             if let Err(e) = close_trade_on_exchange(&trade_snapshot, &hl_executor).await {
@@ -510,6 +513,7 @@ async fn main() -> Result<()> {
                                 Direction::Short => (trade.entry_price - current_price) / trade.entry_price * trade.size_usd,
                             };
                             risk.record_trade_pnl(pnl);
+                            tuner.record_trade();
                             {
                                 let pnl_pct = if initial_usd > 0.0 { (risk.current_equity() - initial_usd) / initial_usd * 100.0 } else { 0.0 };
                                 aggregator.update_daily_pnl(pnl_pct);
@@ -543,13 +547,23 @@ async fn main() -> Result<()> {
                                 entry_bb_position: trade.entry_bb_position,
                             };
                             let _ = journal.log_entry(&record);
+                            if let Some(ref tg) = telegram {
+                                let r = record.clone();
+                                let tg_ref = tg.clone();
+                                tokio::spawn(async move { tg_ref.send_trade_close(&r).await });
+                            }
 
                             let _ = tui_tx_clone.send(TuiUpdate::Log(format!(
                                 "[{}] {} position expired — force closed, PnL: ${:.2}",
                                 chrono::Utc::now().format("%H:%M:%S"),
                                 trade.symbol, pnl,
                             ))).await;
+                            any_expired_closed = true;
                         }
+                    }
+                    if any_expired_closed {
+                        // Forced close should not leave us in a post-execute cooldown pause.
+                        llm_cooldown_until = None;
                     }
                     risk.set_open_positions(position_monitor.open_count(), &cfg);
 
@@ -647,7 +661,11 @@ async fn main() -> Result<()> {
                     // Check tuning triggers
                     if let Some(trigger) = tuner.should_tune() {
                         info!(trigger = ?trigger, "Tuning triggered");
-                        let recent_trades = journal.read_recent(20).unwrap_or_default();
+                        let tune_batch_n = cfg.tuning.tune_every_n_trades.max(1) as usize;
+                        let recent_trades = journal.read_recent(tune_batch_n).unwrap_or_default();
+                        let movement_summary = aggregator
+                            .indicators
+                            .recent_price_movement_summary(8);
                         let trades_summary: String = recent_trades.iter().map(|t| {
                             format!("#{} {} {} pnl=${:.2} level={} score={}",
                                 t.id, t.direction, t.play_type,
@@ -655,14 +673,15 @@ async fn main() -> Result<()> {
                         }).collect::<Vec<_>>().join("\n");
 
                         let tune_context = format!(
-                            "Recent trades ({}):\n{}\n\nCurrent signal params:\n{}\n\nTrigger: {:?}",
+                            "Recent trades ({}):\n{}\n\n{}\n\nCurrent signal params:\n{}\n\nTrigger: {:?}",
                             recent_trades.len(),
                             if trades_summary.is_empty() { "No trades yet".to_string() } else { trades_summary },
+                            movement_summary,
                             serde_json::to_string_pretty(&cfg.signals).unwrap_or_default(),
                             trigger,
                         );
 
-                        // Generate 20-trade report on trade-count triggers
+                        // Generate report on trade-count triggers (same batch size as tuning cadence)
                         let is_trade_count = matches!(&trigger, TuneTrigger::TradeCount(_));
 
                         drop(cfg); // Release read lock before write
@@ -673,6 +692,51 @@ async fn main() -> Result<()> {
                                 tuner.apply_tune(&mut cfg_write, &tune_decision);
                                 if let Err(e) = cfg_write.save_signals("data/tuned_signals.toml") {
                                     warn!("Failed to persist tuned signals: {e:#}");
+                                }
+                                // Always record tuning takeaways to memory (not only trade-count reports).
+                                let trigger_label = format!("{trigger:?}");
+                                let adjustments = if tune_decision.adjustments.is_empty() {
+                                    "- none".to_string()
+                                } else {
+                                    tune_decision
+                                        .adjustments
+                                        .iter()
+                                        .map(|a| {
+                                            format!(
+                                                "- {}: {:.4} -> {:.4}",
+                                                a.param, a.old_value, a.new_value
+                                            )
+                                        })
+                                        .collect::<Vec<_>>()
+                                        .join("\n")
+                                };
+                                let tuned_snapshot = format!(
+                                    "strong_threshold={} lean_threshold={} min_atr_pct={} rsi_oversold={} rsi_overbought={} vwap_dev_reversion_pct={} vwap_weight={} cvd_weight={} ob_weight={}",
+                                    cfg_write.signals.strong_threshold,
+                                    cfg_write.signals.lean_threshold,
+                                    cfg_write.signals.min_atr_pct,
+                                    cfg_write.signals.rsi_oversold,
+                                    cfg_write.signals.rsi_overbought,
+                                    cfg_write.signals.vwap_dev_reversion_pct,
+                                    cfg_write.signals.vwap_weight,
+                                    cfg_write.signals.cvd_weight,
+                                    cfg_write.signals.ob_weight,
+                                );
+                                let memory_block = format!(
+                                    "\n## Tune — {}\n### Trigger\n{}\n\n### Adjustments\n{}\n\n### Why\n{}\n\n### Strategy Pattern\n{}\n\n### Parameter Snapshot\n{}",
+                                    chrono::Utc::now().format("%Y-%m-%d %H:%M UTC"),
+                                    trigger_label,
+                                    adjustments,
+                                    tune_decision.reasoning,
+                                    if tune_decision.strategy_pattern.trim().is_empty() {
+                                        "none".to_string()
+                                    } else {
+                                        tune_decision.strategy_pattern.clone()
+                                    },
+                                    tuned_snapshot,
+                                );
+                                if let Err(e) = memory.append(&memory_block) {
+                                    warn!("Failed to append tune memory: {e:#}");
                                 }
                                 let _ = tui_tx_clone.send(TuiUpdate::Log(format!(
                                     "[{}] Signal engine tuned: {}",
@@ -688,7 +752,7 @@ async fn main() -> Result<()> {
 
                         // Report generation (only on trade-count triggers)
                         if is_trade_count {
-                            let recent = journal.read_recent(20).unwrap_or_default();
+                            let recent = journal.read_recent(tune_batch_n).unwrap_or_default();
                             if !recent.is_empty() {
                                 let params_str = {
                                     let c = config_for_engine.read().await;
@@ -838,7 +902,7 @@ async fn handle_llm_decision(
     risk: &mut RiskChecker,
     position_monitor: &mut PositionMonitor,
     second_look: &mut SecondLookScheduler,
-    _tuner: &mut SignalTuner,
+    tuner: &mut SignalTuner,
     hl_executor: &Option<HlExecutor>,
     journal: &TradeLogger,
     tui_tx: &mpsc::Sender<TuiUpdate>,
@@ -897,6 +961,7 @@ async fn handle_llm_decision(
                             Direction::Short => (opp_trade.entry_price - current_price) / opp_trade.entry_price * opp_trade.size_usd,
                         };
                         risk.record_trade_pnl(pnl);
+                        tuner.record_trade();
                         let record = TradeRecord {
                             id: opp_trade.id,
                             ts_open: opp_trade.opened_at,
@@ -925,6 +990,11 @@ async fn handle_llm_decision(
                             entry_bb_position: opp_trade.entry_bb_position,
                         };
                         let _ = journal.log_entry(&record);
+                        if let Some(ref tg) = telegram {
+                            let r = record.clone();
+                            let tg_ref = tg.clone();
+                            tokio::spawn(async move { tg_ref.send_trade_close(&r).await });
+                        }
                         let _ = tui_tx.send(TuiUpdate::Log(format!(
                             "[{}] {} closed (reversed) PnL: ${:.2}",
                             chrono::Utc::now().format("%H:%M:%S"),
@@ -936,7 +1006,17 @@ async fn handle_llm_decision(
             }
 
             let (_in_session, size_mult) = config.active_session();
-            let base_size = risk.max_trade_usd(config) * (size_pct / config.capital.max_trade_pct) * size_mult;
+            let mut effective_size_pct = *size_pct;
+            if matches!(snapshot.level, SignalLevel::StrongLong | SignalLevel::StrongShort) {
+                // Avoid under-betting on high-conviction signals.
+                let strong_floor = (config.capital.max_trade_pct * 0.45).min(config.capital.max_trade_pct);
+                if effective_size_pct < strong_floor {
+                    effective_size_pct = strong_floor;
+                }
+            }
+            let base_size = risk.max_trade_usd(config)
+                * (effective_size_pct / config.capital.max_trade_pct)
+                * size_mult;
             let size_usd = if matches!(snapshot.level, SignalLevel::StrongLong | SignalLevel::StrongShort) {
                 base_size * config.capital.strong_signal_size_mult
             } else {
@@ -946,6 +1026,7 @@ async fn handle_llm_decision(
 
             info!(
                 play_type = %play_type, direction = %direction,
+                llm_size_pct = *size_pct, effective_size_pct = effective_size_pct,
                 size_usd = size_usd, leverage = leverage,
                 "Executing trade"
             );

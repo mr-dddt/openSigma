@@ -130,6 +130,8 @@ impl App {
         self.positions = positions;
         if !self.positions.is_empty() {
             self.status = AgentStatus::InPosition;
+        } else if self.status == AgentStatus::InPosition {
+            self.status = AgentStatus::Scanning;
         }
     }
 

@@ -46,10 +46,10 @@ PORTFOLIO RISK MANAGEMENT (CRITICAL — analyze the PORTFOLIO section holistical
 
 POSITION RULES:
 - With 0 open positions: EXECUTE freely.
-- With 1-2 open positions in SAME direction: You MAY add if STRONG signal AND aggregate_PnL is positive. Reduce size_pct by 40%.
+- With 1-2 open positions in SAME direction: You MAY add on LEAN if momentum is clean, and SHOULD add on STRONG. Reduce size_pct by 20-40% (not zero).
 - With 3+ open positions in SAME direction: SKIP. You have enough exposure.
-- With ANY losing position (PnL negative): SKIP. Let existing trades resolve first.
-- The position list shows REAL unrealized PnL — use it. If you see red, don't add.
+- With losing position: do NOT auto-skip. If signal is STRONG and margin_heat is healthy (<40%), you may still add small.
+- The position list shows REAL unrealized PnL — use it, but avoid rigid freeze unless risk is genuinely high.
 - Keep reasoning concise (1 sentence)"#;
 
 /// LLM Gate: builds context from signal snapshot + memory, sends to Claude,

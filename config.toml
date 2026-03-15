@@ -1,6 +1,6 @@
 [capital]
 initial_usd = 50.0
-max_trade_pct = 10.0
+max_trade_pct = 35.0
 # Aggressive preset: STRONG signal can deploy more capital
 strong_signal_size_mult = 1.8
 max_concurrent_positions = 10
@@ -11,7 +11,7 @@ kill_switch_drawdown_pct = 20.0
 max_leverage = 50
 
 [execution]
-max_trade_duration_secs = 600
+max_trade_duration_secs = 1800
 max_second_looks = 3
 signal_eval_interval_secs = 5
 
@@ -57,7 +57,7 @@ vwap_dev_reversion_pct = 0.30
 vwap_weight = 1
 
 [tuning]
-tune_every_n_trades = 20
+tune_every_n_trades = 5
 inactivity_timeout_secs = 600
 
 [telegram]

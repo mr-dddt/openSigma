@@ -125,6 +125,7 @@ impl SignalTuner {
                 "Tune adjustment applied"
             );
         }
+        enforce_triggerability_invariants(&mut config.signals);
         self.mark_tuned();
     }
 
@@ -163,4 +164,23 @@ fn clamp_adjustment(adj: &TuneAdjustment, signals: &crate::config::SignalConfig)
     } else {
         result
     }
+}
+
+/// Keep tuned params inside practical bounds so the bot still triggers.
+fn enforce_triggerability_invariants(signals: &mut crate::config::SignalConfig) {
+    // Prevent drift into no-trade mode.
+    signals.lean_threshold = signals.lean_threshold.clamp(2, 4);
+    signals.strong_threshold = signals.strong_threshold.clamp(4, 6);
+    if signals.strong_threshold <= signals.lean_threshold {
+        signals.strong_threshold = (signals.lean_threshold + 1).min(6);
+    }
+    // RSI sanity band
+    signals.rsi_oversold = signals.rsi_oversold.clamp(20.0, 50.0);
+    signals.rsi_overbought = signals.rsi_overbought.clamp(50.0, 80.0);
+    if signals.rsi_oversold >= signals.rsi_overbought {
+        signals.rsi_oversold = (signals.rsi_overbought - 5.0).max(20.0);
+    }
+    // Volatility floors/caps
+    signals.min_atr_pct = signals.min_atr_pct.clamp(0.01, 0.20);
+    signals.vwap_dev_reversion_pct = signals.vwap_dev_reversion_pct.clamp(0.10, 1.00);
 }
