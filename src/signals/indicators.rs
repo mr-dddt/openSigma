@@ -330,6 +330,24 @@ impl Indicators {
         }
     }
 
+    /// Rolling VWAP from recent 1m candles.
+    pub fn vwap_1m(&self, period: usize) -> Option<f64> {
+        if self.candles_1m.len() < period {
+            return None;
+        }
+        let mut pv = 0.0;
+        let mut vol = 0.0;
+        for c in self.candles_1m.iter().rev().take(period) {
+            pv += c.close * c.volume;
+            vol += c.volume;
+        }
+        if vol > 0.0 {
+            Some(pv / vol)
+        } else {
+            None
+        }
+    }
+
     // -----------------------------------------------------------------------
     // CVD (Cumulative Volume Delta) — 5-minute rolling
     // -----------------------------------------------------------------------

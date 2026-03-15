@@ -53,6 +53,8 @@ Tunable parameters:
 - rsi_oversold (float, RSI level considered oversold)
 - rsi_overbought (float, RSI level considered overbought)
 - min_atr_pct (float, minimum ATR% to allow trading)
+- vwap_dev_reversion_pct (float, VWAP deviation threshold for anti-chasing/mean-reversion)
+- vwap_weight (int, score weight for VWAP deviation signal)
 
 Rules:
 - Only suggest changes you are confident will improve performance

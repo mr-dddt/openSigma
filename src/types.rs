@@ -171,6 +171,8 @@ pub struct IndicatorValues {
     pub ob_imbalance: Option<f64>,
     pub regime: Option<String>,
     pub ema_spread_pct: Option<f64>,
+    pub vwap: Option<f64>,
+    pub vwap_dev_pct: Option<f64>,
 }
 
 // ---------------------------------------------------------------------------

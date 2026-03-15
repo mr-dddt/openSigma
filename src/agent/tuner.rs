@@ -107,6 +107,12 @@ impl SignalTuner {
                 "min_atr_pct" => {
                     config.signals.min_atr_pct = clamped;
                 }
+                "vwap_dev_reversion_pct" => {
+                    config.signals.vwap_dev_reversion_pct = clamped.max(0.0);
+                }
+                "vwap_weight" => {
+                    config.signals.vwap_weight = clamped.max(0.0) as i32;
+                }
                 other => {
                     warn!(param = other, "Unknown tune parameter, ignoring");
                 }
@@ -142,6 +148,8 @@ fn clamp_adjustment(adj: &TuneAdjustment, signals: &crate::config::SignalConfig)
         "rsi_oversold" => (signals.rsi_oversold, 10.0),
         "rsi_overbought" => (signals.rsi_overbought, 10.0),
         "min_atr_pct" => (signals.min_atr_pct, 0.02),
+        "vwap_dev_reversion_pct" => (signals.vwap_dev_reversion_pct, 0.1),
+        "vwap_weight" => (signals.vwap_weight as f64, 1.0),
         _ => return adj.new_value,
     };
 

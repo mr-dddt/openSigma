@@ -217,6 +217,32 @@ impl SignalAggregator {
             }
         }
 
+        // --- VWAP + deviation (mean-reversion anchor + anti-chasing context) ---
+        if let Some(vwap) = self.indicators.vwap_1m(20) {
+            indicators.vwap = Some(vwap);
+            if vwap > 0.0 {
+                let dev_pct = ((self.latest_price - vwap) / vwap) * 100.0;
+                indicators.vwap_dev_pct = Some(dev_pct);
+                let band = sig.vwap_dev_reversion_pct;
+                let is_range = indicators.bb_squeeze || indicators.regime.as_deref() == Some("range");
+                if dev_pct >= band {
+                    // Price stretched above VWAP: fade in range, follow lightly in trend.
+                    if is_range {
+                        bear += sig.vwap_weight;
+                    } else if indicators.regime.as_deref() == Some("trend_up") {
+                        bull += 1;
+                    }
+                } else if dev_pct <= -band {
+                    // Price stretched below VWAP: fade in range, follow lightly in trend.
+                    if is_range {
+                        bull += sig.vwap_weight;
+                    } else if indicators.regime.as_deref() == Some("trend_down") {
+                        bear += 1;
+                    }
+                }
+            }
+        }
+
         // --- ATR ---
         indicators.atr_14 = self.indicators.atr_14();
         indicators.atr_pct = self.indicators.atr_pct(self.latest_price);
@@ -297,6 +323,21 @@ impl SignalAggregator {
                 "Funding {:.4}% in short direction",
                 self.latest_funding
             ));
+        }
+
+        // VWAP anti-chasing filter: avoid entering when price is already overextended
+        // away from VWAP in the same trade direction.
+        if let Some(vwap) = self.indicators.vwap_1m(20) {
+            if vwap > 0.0 && self.latest_price > 0.0 {
+                let dev_pct = ((self.latest_price - vwap) / vwap) * 100.0;
+                let band = config.signals.vwap_dev_reversion_pct;
+                if net_score > 0 && dev_pct > band {
+                    return Some(format!("Price {:+.2}% above VWAP (long overextended)", dev_pct));
+                }
+                if net_score < 0 && dev_pct < -band {
+                    return Some(format!("Price {:+.2}% below VWAP (short overextended)", dev_pct));
+                }
+            }
         }
 
         None

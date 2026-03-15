@@ -122,6 +122,12 @@ pub struct SignalConfig {
     /// EMA spread threshold (%) for trend regime.
     #[serde(default = "default_regime_trend_spread_pct")]
     pub regime_trend_spread_pct: f64,
+    /// VWAP deviation (%) threshold for mean-reversion / anti-chasing checks.
+    #[serde(default = "default_vwap_dev_reversion_pct")]
+    pub vwap_dev_reversion_pct: f64,
+    /// VWAP scoring weight when deviation is meaningful.
+    #[serde(default = "default_1")]
+    pub vwap_weight: i32,
 }
 
 fn default_2() -> i32 { 2 }
@@ -133,6 +139,7 @@ fn default_cvd_slope_threshold() -> f64 { 30.0 }
 fn default_ob_lean_threshold() -> f64 { 1.3 }
 fn default_ob_strong_threshold() -> f64 { 2.0 }
 fn default_regime_trend_spread_pct() -> f64 { 0.05 }
+fn default_vwap_dev_reversion_pct() -> f64 { 0.3 }
 
 #[derive(Debug, Clone, Deserialize)]
 pub struct TuningConfig {

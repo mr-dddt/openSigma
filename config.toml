@@ -53,6 +53,8 @@ cvd_slope_threshold = 15.0
 ob_lean_threshold = 1.2
 ob_strong_threshold = 1.7
 regime_trend_spread_pct = 0.03
+vwap_dev_reversion_pct = 0.30
+vwap_weight = 1
 
 [tuning]
 tune_every_n_trades = 20

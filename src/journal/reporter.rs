@@ -22,7 +22,7 @@ Respond with ONLY a valid JSON object:
 Rules:
 - Use the per-trade entry conditions (rsi, cvd, ob, atr_pct, bb_position) to find what setups work/fail. Refer to concrete values (e.g. "Longs when RSI<35 and CVD>0 won 80%").
 - memory_rules: 0-3 max, actionable (e.g. "When RSI<30 and CVD>0, lean_long wins often — consider lower lean_threshold" or "Strong entries after 3 losses tend to fail").
-- param_adjustments: optional. Suggest 0-3 signal param changes when data supports it. Supported params: strong_threshold (int), lean_threshold (int), min_atr_pct (float), rsi_oversold (float), rsi_overbought (float). reason must cite the condition (e.g. "strong_threshold=5 too strict when RSI<35; wins at score 4").
+- param_adjustments: optional. Suggest 0-3 signal param changes when data supports it. Supported params: strong_threshold (int), lean_threshold (int), min_atr_pct (float), rsi_oversold (float), rsi_overbought (float), vwap_dev_reversion_pct (float), vwap_weight (int). reason must cite the condition (e.g. "strong_threshold=5 too strict when RSI<35; wins at score 4").
 - Keep summary concise — shown in TUI and Telegram.
 - If no clear patterns or no confident param change, use empty arrays."#;
 
@@ -601,6 +601,16 @@ pub fn apply_param_adjustments(config: &mut crate::config::Config, adjustments: 
         } else if name == "rsi_overbought" {
             adj.value.as_f64().map(|v| {
                 config.signals.rsi_overbought = v;
+                true
+            })
+        } else if name == "vwap_dev_reversion_pct" {
+            adj.value.as_f64().map(|v| {
+                config.signals.vwap_dev_reversion_pct = v.max(0.0);
+                true
+            })
+        } else if name == "vwap_weight" {
+            adj.value.as_i64().map(|n| {
+                config.signals.vwap_weight = n.max(0) as i32;
                 true
             })
         } else {

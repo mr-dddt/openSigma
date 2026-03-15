@@ -163,7 +163,7 @@ impl App {
         let chunks = Layout::default()
             .direction(ratatui::layout::Direction::Vertical)
             .constraints([
-                Constraint::Length(7),         // top: status + signal
+                Constraint::Length(8),         // top: status + signal
                 Constraint::Length(pos_height), // positions: grows with count
                 Constraint::Min(6),            // log
                 Constraint::Length(3),          // footer: stats + keys
@@ -267,6 +267,25 @@ impl App {
                             .map(|v| format!("{v:.3}"))
                             .unwrap_or_else(|| "n/a".to_string())
                     )),
+                ]),
+                Line::from(vec![
+                    Span::styled(" VWAP:", Style::default().fg(Color::Cyan)),
+                    Span::raw(format!(
+                        " {}",
+                        ind.vwap
+                            .map(|v| format!("{v:.1}"))
+                            .unwrap_or_else(|| "n/a".to_string())
+                    )),
+                    Span::styled("  Dev%:", Style::default().fg(Color::Cyan)),
+                    Span::styled(
+                        format!(
+                            " {}",
+                            ind.vwap_dev_pct
+                                .map(|v| format!("{v:+.3}"))
+                                .unwrap_or_else(|| "n/a".to_string())
+                        ),
+                        Style::default().fg(vwap_dev_color(ind.vwap_dev_pct)),
+                    ),
                 ]),
                 Line::from(vec![
                     Span::styled(" Filter: ", Style::default().fg(Color::DarkGray)),
@@ -475,6 +494,15 @@ fn regime_color(ind: &crate::types::IndicatorValues) -> Color {
             }
         }
         _ => Color::DarkGray,
+    }
+}
+
+fn vwap_dev_color(dev: Option<f64>) -> Color {
+    match dev {
+        Some(v) if v >= 0.3 => Color::Red,
+        Some(v) if v <= -0.3 => Color::Green,
+        Some(_) => Color::DarkGray,
+        None => Color::DarkGray,
     }
 }
 

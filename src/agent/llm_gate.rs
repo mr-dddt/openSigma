@@ -33,6 +33,7 @@ AGGRESSIVE SCALPING RULES:
 - STRONG signals (net 5+): Execute with 25-50x leverage, full size
 - During BB squeeze near bands: mean-reversion candidate, go aggressive
 - On BB breakout: FULL SEND in breakout direction
+- Use VWAP as mean-reversion anchor: if price is stretched far from VWAP, avoid chasing that direction
 - SecondLook only if timing is genuinely bad (not for hesitation)
 
 PORTFOLIO RISK MANAGEMENT (CRITICAL — analyze the PORTFOLIO section holistically):
@@ -96,6 +97,7 @@ impl LlmGate {
             "Signal: {} (net_score={}, bull={}, bear={})\n\
              EMA9={:.1} EMA21={:.1} RSI={:.1} StochRSI={:.1}\n\
              CVD={:.2} OB_Imbalance={:.2} ATR%={:.3} Funding%={:.4}\n\
+             VWAP={:.1} VWAP_dev%={:+.3}\n\
              BB: {}\n\
              Session: {} (size_mult={:.1})\n\
              Config: max_trade_pct={:.1}, max_leverage={}, max_duration={}s\n\
@@ -113,6 +115,8 @@ impl LlmGate {
             ind.ob_imbalance.unwrap_or(1.0),
             ind.atr_pct.unwrap_or(0.0),
             ind.funding_rate.unwrap_or(0.0),
+            ind.vwap.unwrap_or(0.0),
+            ind.vwap_dev_pct.unwrap_or(0.0),
             bb_state,
             if in_session { "active" } else { "inactive" },
             size_mult,
