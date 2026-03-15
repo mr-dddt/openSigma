@@ -1,9 +1,15 @@
 [capital]
 initial_usd = 50.0
 max_trade_pct = 10.0
-max_concurrent_positions = 10
+# When STRONG signal, allow more capital (1.5 = up to 15% effective)
+strong_signal_size_mult = 1.5
+max_concurrent_positions = 999
 max_daily_loss_pct = 10.0
 kill_switch_drawdown_pct = 20.0
+# Set kill_switch_enabled = false for 24/7 mode (no auto-stop on drawdown)
+kill_switch_enabled = false
+# Reset kill switch at UTC midnight so trading resumes next day
+kill_switch_auto_reset = true
 
 [hyperliquid]
 max_leverage = 50

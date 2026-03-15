@@ -1,36 +1,34 @@
-use anyhow::Result;
+use chrono::{Datelike, Utc};
 use tracing::error;
-
-use crate::execution::hyperliquid::HlExecutor;
 
 /// Kill switch: emergency close all positions.
 pub struct KillSwitch {
     pub triggered: bool,
+    triggered_day: Option<u32>,
 }
 
 impl KillSwitch {
     pub fn new() -> Self {
-        Self { triggered: false }
-    }
-
-    /// Trigger kill switch and close all positions.
-    #[allow(dead_code)]
-    pub async fn trigger_with_executor(
-        &mut self,
-        hl: &HlExecutor,
-    ) -> Result<()> {
-        error!("KILL SWITCH ACTIVATED — closing all positions");
-        self.triggered = true;
-
-        if let Err(e) = hl.close_all().await {
-            error!("Failed to close HL positions: {e:#}");
+        Self {
+            triggered: false,
+            triggered_day: None,
         }
-
-        Ok(())
     }
 
     pub fn trigger(&mut self) {
         error!("KILL SWITCH ACTIVATED");
         self.triggered = true;
+        self.triggered_day = Some(Utc::now().ordinal());
+    }
+
+    /// Reset kill switch (e.g. at UTC midnight for auto recovery).
+    pub fn reset(&mut self) {
+        self.triggered = false;
+        self.triggered_day = None;
+    }
+
+    /// Day when kill switch was triggered (for auto reset at midnight).
+    pub fn triggered_day(&self) -> Option<u32> {
+        self.triggered_day
     }
 }

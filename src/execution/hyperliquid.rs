@@ -260,13 +260,21 @@ impl HlExecutor {
     /// Close all positions (market sell/buy to flatten).
     pub async fn close_all(&self) -> Result<()> {
         let positions = self.positions().await?;
+        let mut errors = Vec::new();
         for pos in positions {
             let is_buy = pos.size < 0.0;
             let sz = pos.size.abs();
             info!(coin = %pos.coin, size = sz, "Closing HL position");
-            let _ = self.market_order(&pos.coin, is_buy, sz, pos.leverage).await;
+            if let Err(e) = self.market_order(&pos.coin, is_buy, sz, pos.leverage).await {
+                warn!(coin = %pos.coin, "Failed to close position: {e:#}");
+                errors.push(format!("{}: {e}", pos.coin));
+            }
         }
-        Ok(())
+        if errors.is_empty() {
+            Ok(())
+        } else {
+            anyhow::bail!("Failed to close {} position(s): {}", errors.len(), errors.join(", "))
+        }
     }
 
     fn parse_response(

@@ -66,12 +66,12 @@ pub struct App {
     pub trade_log: Vec<String>,
     #[allow(dead_code)]
     pub initial_equity: f64,
-    pub config_initial_usd: f64,
     pub equity: f64,
     pub total_pnl_pct: f64,
     pub daily_pnl_pct: f64,
     start_of_day_equity: f64,
     current_day: u32,
+    #[allow(dead_code)]
     pub max_positions: u32,
     // Phase 3 additions
     pub positions: Vec<PositionInfo>,
@@ -80,7 +80,7 @@ pub struct App {
 }
 
 impl App {
-    pub fn new(initial_equity: f64, config_initial_usd: f64, max_positions: u32) -> Self {
+    pub fn new(initial_equity: f64, _config_initial_usd: f64, max_positions: u32) -> Self {
         let today = Utc::now().ordinal();
         let start_of_day_equity = match load_daily_state() {
             Some(state) if state.date == Utc::now().format("%Y-%m-%d").to_string() => {
@@ -97,7 +97,6 @@ impl App {
             latest_signal: None,
             trade_log: Vec::new(),
             initial_equity,
-            config_initial_usd,
             equity: initial_equity,
             total_pnl_pct: 0.0,
             daily_pnl_pct: 0.0,
@@ -131,6 +130,8 @@ impl App {
         self.positions = positions;
         if !self.positions.is_empty() {
             self.status = AgentStatus::InPosition;
+        } else if self.status == AgentStatus::InPosition {
+            self.status = AgentStatus::Scanning;
         }
     }
 
@@ -141,9 +142,9 @@ impl App {
     pub fn update_balances(&mut self, balances: ExchangeBalances) {
         self.balances = balances;
         self.equity = self.balances.hl_equity;
-        // Total PnL since inception (based on original capital from config)
-        if self.config_initial_usd > 0.0 {
-            self.total_pnl_pct = ((self.equity - self.config_initial_usd) / self.config_initial_usd) * 100.0;
+        // Total PnL since session start (actual balance when bot started, not config)
+        if self.initial_equity > 0.0 {
+            self.total_pnl_pct = ((self.equity - self.initial_equity) / self.initial_equity) * 100.0;
         }
         // Daily PnL (reset at UTC midnight, persisted to disk)
         let today = Utc::now().ordinal();
@@ -158,7 +159,7 @@ impl App {
     }
 
     pub fn render_frame(&self, frame: &mut Frame) {
-        let pos_height = (self.positions.len() as u16 + 2).max(4).min(14);
+        let pos_height = (self.positions.len() as u16 + 2).clamp(4, 14);
         let chunks = Layout::default()
             .direction(ratatui::layout::Direction::Vertical)
             .constraints([
@@ -267,7 +268,7 @@ impl App {
     }
 
     fn render_positions(&self, frame: &mut Frame, area: Rect) {
-        let title = format!(" Positions [{}/{}] ", self.positions.len(), self.max_positions);
+        let title = " Positions ";
         let items: Vec<ListItem> = if self.positions.is_empty() {
             vec![ListItem::new(Span::styled("  No active positions", Style::default().fg(Color::DarkGray)))]
         } else {

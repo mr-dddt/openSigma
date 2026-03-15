@@ -9,9 +9,7 @@ pub struct PositionMonitor {
     pub active_trades: Vec<ActiveTrade>,
 }
 
-#[allow(dead_code)]
 pub enum PositionEvent {
-    Expired(Uuid),
     StopHit(Uuid),
     TakeProfitHit(Uuid),
 }
@@ -54,7 +52,9 @@ impl PositionMonitor {
         let mut events = Vec::new();
 
         for trade in &self.active_trades {
-
+            if trade.entry_price <= 0.0 {
+                continue;
+            }
             let pnl_pct = match trade.direction {
                 crate::types::Direction::Long => {
                     (current_price - trade.entry_price) / trade.entry_price * 100.0
@@ -78,11 +78,6 @@ impl PositionMonitor {
         self.active_trades.len() as u32
     }
 
-    #[allow(dead_code)]
-    pub fn active_trades(&self) -> &[ActiveTrade] {
-        &self.active_trades
-    }
-
     /// Find all positions in the opposite direction. Used to close
     /// counter-trend positions before opening new ones.
     pub fn opposite_direction_ids(&self, direction: crate::types::Direction) -> Vec<Uuid> {
@@ -93,27 +88,4 @@ impl PositionMonitor {
             .collect()
     }
 
-    /// Check if any positions exist in the opposite direction.
-    #[allow(dead_code)]
-    pub fn has_opposite(&self, direction: crate::types::Direction) -> bool {
-        self.active_trades.iter().any(|t| t.direction != direction)
-    }
-
-    /// Calculate total unrealized PnL.
-    #[allow(dead_code)]
-    pub fn unrealized_pnl(&self, current_price: f64) -> f64 {
-        self.active_trades
-            .iter()
-            .map(|t| {
-                match t.direction {
-                    crate::types::Direction::Long => {
-                        (current_price - t.entry_price) / t.entry_price * t.size_usd
-                    }
-                    crate::types::Direction::Short => {
-                        (t.entry_price - current_price) / t.entry_price * t.size_usd
-                    }
-                }
-            })
-            .sum()
-    }
 }

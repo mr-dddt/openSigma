@@ -57,22 +57,35 @@ impl HyperliquidFeed {
         }
         info!("Subscribed to HL channels: allMids + trades/l2Book/activeAssetCtx(BTC)");
 
-        while let Some(msg) = read.next().await {
-            match msg {
-                Ok(Message::Text(text)) => {
-                    // Silently ignore parse errors — HL sends subscription confirmations,
-                    // heartbeats, and other messages that don't match our known types.
-                    let _ = self.handle_message(&text).await;
+        // HL closes connections if no message received in 60s — send ping every 40s to keep alive
+        let mut ping_interval = tokio::time::interval(tokio::time::Duration::from_secs(40));
+        ping_interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+
+        loop {
+            tokio::select! {
+                Some(msg) = read.next() => {
+                    match msg {
+                        Ok(Message::Text(text)) => {
+                            let _ = self.handle_message(&text).await;
+                        }
+                        Ok(Message::Ping(data)) => {
+                            let _ = write.send(Message::Pong(data)).await;
+                        }
+                        Ok(Message::Close(_)) => break,
+                        Err(e) => {
+                            error!("HL WebSocket read error: {e}");
+                            break;
+                        }
+                        _ => {}
+                    }
                 }
-                Ok(Message::Ping(data)) => {
-                    let _ = write.send(Message::Pong(data)).await;
+                _ = ping_interval.tick() => {
+                    let ping = serde_json::json!({ "method": "ping" });
+                    if let Err(e) = write.send(Message::Text(ping.to_string())).await {
+                        error!("HL WebSocket ping failed: {e}");
+                        break;
+                    }
                 }
-                Ok(Message::Close(_)) => break,
-                Err(e) => {
-                    error!("HL WebSocket read error: {e}");
-                    break;
-                }
-                _ => {}
             }
         }
 
@@ -126,8 +139,14 @@ impl HyperliquidFeed {
             } else {
                 Direction::Short
             };
-            let price = t.px.parse::<f64>().unwrap_or(0.0);
-            let size = t.sz.parse::<f64>().unwrap_or(0.0);
+            let price = match t.px.parse::<f64>() {
+                Ok(p) if p > 0.0 => p,
+                _ => continue,
+            };
+            let size = match t.sz.parse::<f64>() {
+                Ok(s) if s > 0.0 => s,
+                _ => continue,
+            };
 
             let _ = self
                 .event_tx
@@ -177,6 +196,9 @@ impl HyperliquidFeed {
                 .collect()
         };
 
+        if book.levels.is_empty() {
+            return;
+        }
         let bids = parse_levels(&book.levels[0]);
         let asks = if book.levels.len() > 1 {
             parse_levels(&book.levels[1])
@@ -356,7 +378,7 @@ pub async fn fetch_historical_candles(
         "5m" => 300_000,
         _ => 60_000,
     };
-    let start_ms = now_ms - (count as u64 * interval_ms);
+    let start_ms = now_ms.saturating_sub(count as u64 * interval_ms);
 
     let body = serde_json::json!({
         "type": "candleSnapshot",

@@ -47,6 +47,9 @@ impl Indicators {
 
     /// Accumulate trade for CVD calculation.
     pub fn add_trade(&mut self, size: f64, is_buy: bool) {
+        if size <= 0.0 {
+            return;
+        }
         let now = chrono::Utc::now();
 
         // Reset CVD every 5 minutes
@@ -190,12 +193,6 @@ impl Indicators {
         let collect_from = n - stoch_period;
         let mut rsi_values = Vec::with_capacity(stoch_period);
 
-        // First RSI value is at index rsi_period
-        if rsi_period >= collect_from {
-            let rsi = if avg_loss == 0.0 { 100.0 } else { 100.0 - (100.0 / (1.0 + avg_gain / avg_loss)) };
-            rsi_values.push(rsi);
-        }
-
         for i in (rsi_period + 1)..n {
             let change = candles[i].close - candles[i - 1].close;
             let gain = if change > 0.0 { change } else { 0.0 };
@@ -255,7 +252,7 @@ impl Indicators {
     /// BB squeeze: bandwidth < 1% of SMA (genuinely tight consolidation).
     /// 4% was too aggressive — blocked trades during normal BTC ranges.
     pub fn bb_squeeze(&self) -> bool {
-        self.bb_bandwidth().map_or(false, |bw| bw < 0.01)
+        self.bb_bandwidth().is_some_and(|bw| bw < 0.01)
     }
 
     /// BB bandwidth as fraction of SMA (0.0 = zero width, typical 0.01–0.06).
@@ -329,12 +326,6 @@ impl Indicators {
 
     pub fn cvd(&self) -> f64 {
         self.cvd_buys - self.cvd_sells
-    }
-
-    /// CVD direction: positive = net buying, negative = net selling.
-    #[allow(dead_code)]
-    pub fn cvd_rising(&self) -> bool {
-        self.cvd() > 0.0
     }
 
     // -----------------------------------------------------------------------

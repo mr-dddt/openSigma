@@ -77,12 +77,4 @@ impl TradeLogger {
         Ok(records)
     }
 
-    /// Count total trades logged.
-    #[allow(dead_code)]
-    pub fn trade_count(&self) -> usize {
-        match std::fs::File::open(&self.path) {
-            Ok(f) => BufReader::new(f).lines().count(),
-            Err(_) => 0,
-        }
-    }
 }

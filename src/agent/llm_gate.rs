@@ -94,8 +94,8 @@ impl LlmGate {
 
         format!(
             "Signal: {} (net_score={}, bull={}, bear={})\n\
-             EMA9={:.1} EMA21={:.1} RSI={:.1} StochRSI={:.1}\n\
-             CVD={:.2} OB_Imbalance={:.2} ATR%={:.3}\n\
+             EMA9={} EMA21={} RSI={} StochRSI={}\n\
+             CVD={} OB_Imbalance={} ATR%={}\n\
              BB: {}\n\
              Session: {} (size_mult={:.1})\n\
              Config: max_trade_pct={:.1}, max_leverage={}, max_duration={}s\n\
@@ -105,13 +105,13 @@ impl LlmGate {
             snapshot.net_score,
             snapshot.bull_score,
             snapshot.bear_score,
-            ind.ema_9.unwrap_or(0.0),
-            ind.ema_21.unwrap_or(0.0),
-            ind.rsi_14.unwrap_or(50.0),
-            ind.stoch_rsi.unwrap_or(50.0),
-            ind.cvd.unwrap_or(0.0),
-            ind.ob_imbalance.unwrap_or(1.0),
-            ind.atr_pct.unwrap_or(0.0),
+            ind.ema_9.map_or("N/A".to_string(), |v| format!("{v:.1}")),
+            ind.ema_21.map_or("N/A".to_string(), |v| format!("{v:.1}")),
+            ind.rsi_14.map_or("N/A".to_string(), |v| format!("{v:.1}")),
+            ind.stoch_rsi.map_or("N/A".to_string(), |v| format!("{v:.1}")),
+            ind.cvd.map_or("N/A".to_string(), |v| format!("{v:.2}")),
+            ind.ob_imbalance.map_or("N/A".to_string(), |v| format!("{v:.2}")),
+            ind.atr_pct.map_or("N/A".to_string(), |v| format!("{v:.3}")),
             bb_state,
             if in_session { "active" } else { "inactive" },
             size_mult,

@@ -46,10 +46,6 @@ impl RiskChecker {
             if exchange_equity > self.peak_equity {
                 self.peak_equity = exchange_equity;
             }
-            // Initialize peak and start-of-day on first sync
-            if self.peak_equity <= 0.0 {
-                self.peak_equity = exchange_equity;
-            }
             if self.start_of_day_equity <= 0.0 {
                 self.start_of_day_equity = exchange_equity;
             }
@@ -94,6 +90,9 @@ impl RiskChecker {
         }
 
         let base = if self.start_of_day_equity > 0.0 { self.start_of_day_equity } else { self.current_equity };
+        if base <= 0.0 {
+            return Ok(());
+        }
         let daily_loss_pct = (self.daily_loss_usd / base) * 100.0;
         if daily_loss_pct >= config.capital.max_daily_loss_pct {
             return Err(format!(
@@ -102,14 +101,10 @@ impl RiskChecker {
             ));
         }
 
-        let drawdown_pct = if self.peak_equity > 0.0 {
-            ((self.peak_equity - self.current_equity) / self.peak_equity) * 100.0
-        } else {
-            0.0
-        };
-        if drawdown_pct >= config.capital.kill_switch_drawdown_pct {
-            warn!(drawdown = drawdown_pct, "Kill switch triggered");
-            return Err(format!("Kill switch: {:.1}% drawdown", drawdown_pct));
+        let dd = self.drawdown_pct();
+        if dd >= config.capital.kill_switch_drawdown_pct {
+            warn!(drawdown = dd, "Kill switch triggered");
+            return Err(format!("Kill switch: {:.1}% drawdown", dd));
         }
 
         Ok(())
@@ -129,6 +124,8 @@ impl RiskChecker {
         if let LlmDecision::Execute {
             size_pct,
             hl_leverage,
+            stop_loss_pct,
+            take_profit_pct,
             ..
         } = decision
         {
@@ -151,6 +148,18 @@ impl RiskChecker {
                         lev, config.hyperliquid.max_leverage
                     ));
                 }
+            }
+            if *stop_loss_pct <= 0.0 || *stop_loss_pct > 5.0 {
+                return Err(format!(
+                    "Stop loss {:.2}% out of valid range (0.01–5.0%)",
+                    stop_loss_pct
+                ));
+            }
+            if *take_profit_pct <= 0.0 || *take_profit_pct > 10.0 {
+                return Err(format!(
+                    "Take profit {:.2}% out of valid range (0.01–10.0%)",
+                    take_profit_pct
+                ));
             }
         }
         Ok(())
@@ -193,9 +202,7 @@ impl RiskChecker {
         if self.peak_equity <= 0.0 {
             return false;
         }
-        let drawdown_pct =
-            ((self.peak_equity - self.current_equity) / self.peak_equity) * 100.0;
-        drawdown_pct >= config.capital.kill_switch_drawdown_pct
+        self.drawdown_pct() >= config.capital.kill_switch_drawdown_pct
     }
 
     pub fn current_equity(&self) -> f64 {
@@ -203,14 +210,17 @@ impl RiskChecker {
     }
 
     #[allow(dead_code)]
-    pub fn start_of_day_equity(&self) -> f64 {
-        self.start_of_day_equity
+    pub fn daily_pnl_pct(&self) -> f64 {
+        if self.start_of_day_equity > 0.0 {
+            ((self.current_equity - self.start_of_day_equity) / self.start_of_day_equity) * 100.0
+        } else {
+            0.0
+        }
     }
 
-    #[allow(dead_code)]
-    pub fn daily_pnl_pct(&self) -> f64 {
+    pub fn drawdown_pct(&self) -> f64 {
         if self.peak_equity > 0.0 {
-            ((self.current_equity - self.peak_equity) / self.peak_equity) * 100.0
+            ((self.peak_equity - self.current_equity) / self.peak_equity) * 100.0
         } else {
             0.0
         }

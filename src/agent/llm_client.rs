@@ -38,18 +38,18 @@ struct ContentBlock {
 }
 
 impl LlmClient {
-    pub fn new(api_key: String, model: String, timeout_ms: u64) -> Self {
+    pub fn new(api_key: String, model: String, timeout_ms: u64) -> Result<Self> {
         let client = reqwest::Client::builder()
             .timeout(Duration::from_millis(timeout_ms))
             .build()
-            .expect("Failed to build HTTP client");
+            .context("Failed to build HTTP client")?;
 
         info!(model = %model, "LlmClient initialized");
-        Self {
+        Ok(Self {
             client,
             api_key,
             model,
-        }
+        })
     }
 
     /// Send signal context to Claude and parse trade decision.
@@ -59,33 +59,29 @@ impl LlmClient {
         user_prompt: &str,
     ) -> Result<LlmDecision> {
         let text = self.call_api(system_prompt, user_prompt, 512).await?;
-
-        // Extract JSON from the response (may be wrapped in markdown code blocks)
         let json_str = extract_json(&text);
 
-        for attempt in 0..3 {
-            match serde_json::from_str::<LlmDecision>(json_str) {
-                Ok(decision) => return Ok(decision),
-                Err(e) => {
-                    if attempt < 2 {
-                        warn!(attempt = attempt + 1, error = %e, "Failed to parse LLM decision, retrying");
-                        // Retry with a hint
-                        let retry_prompt = format!(
-                            "Your previous response was not valid JSON. Error: {e}\n\
-                             Please respond with ONLY valid JSON matching the LlmDecision schema.\n\
-                             Original request:\n{user_prompt}"
-                        );
-                        let retry_text = self.call_api(system_prompt, &retry_prompt, 512).await?;
+        match serde_json::from_str::<LlmDecision>(json_str) {
+            Ok(decision) => return Ok(decision),
+            Err(first_err) => {
+                warn!(error = %first_err, "Failed to parse LLM decision, retrying with hint");
+                let retry_prompt = format!(
+                    "Your previous response was not valid JSON. Error: {first_err}\n\
+                     Please respond with ONLY valid JSON matching the LlmDecision schema.\n\
+                     Original request:\n{user_prompt}"
+                );
+                match self.call_api(system_prompt, &retry_prompt, 512).await {
+                    Ok(retry_text) => {
                         let retry_json = extract_json(&retry_text);
                         if let Ok(d) = serde_json::from_str::<LlmDecision>(retry_json) {
                             return Ok(d);
                         }
                     }
+                    Err(e) => warn!("Retry API call also failed: {e:#}"),
                 }
             }
         }
 
-        // Default to Skip on parse failure
         warn!("All LLM parse attempts failed, defaulting to Skip");
         Ok(LlmDecision::Skip {
             reasoning: "LLM response parse failure — auto-skip".to_string(),
@@ -111,8 +107,16 @@ impl LlmClient {
         let text = self.call_api(system_prompt, context, 1024).await?;
         let json_str = extract_json(&text);
 
-        serde_json::from_str::<TuneDecision>(json_str)
-            .context("Failed to parse TuneDecision from LLM response")
+        match serde_json::from_str::<TuneDecision>(json_str) {
+            Ok(d) => Ok(d),
+            Err(e) => {
+                warn!(error = %e, "Failed to parse TuneDecision, returning no-op");
+                Ok(TuneDecision {
+                    adjustments: vec![],
+                    reasoning: format!("Parse failure (no-op): {e}"),
+                })
+            }
+        }
     }
 
     async fn call_api(
@@ -121,6 +125,7 @@ impl LlmClient {
         user_prompt: &str,
         max_tokens: u32,
     ) -> Result<String> {
+        const MAX_RETRIES: u32 = 3;
         let request = ApiRequest {
             model: self.model.clone(),
             max_tokens,
@@ -131,33 +136,55 @@ impl LlmClient {
             }],
         };
 
-        let response = self
-            .client
-            .post("https://api.anthropic.com/v1/messages")
-            .header("x-api-key", &self.api_key)
-            .header("anthropic-version", "2023-06-01")
-            .header("content-type", "application/json")
-            .json(&request)
-            .send()
-            .await
-            .context("Failed to send request to Claude API")?;
+        let mut last_err = None;
+        for attempt in 0..MAX_RETRIES {
+            let result = self
+                .client
+                .post("https://api.anthropic.com/v1/messages")
+                .header("x-api-key", &self.api_key)
+                .header("anthropic-version", "2023-06-01")
+                .header("content-type", "application/json")
+                .json(&request)
+                .send()
+                .await;
 
-        let status = response.status();
-        if !status.is_success() {
-            let body = response.text().await.unwrap_or_default();
-            anyhow::bail!("Claude API returned {status}: {body}");
+            match result {
+                Ok(response) => {
+                    let status = response.status();
+                    if !status.is_success() {
+                        let body = response.text().await.unwrap_or_default();
+                        last_err = Some(anyhow::anyhow!("Claude API returned {status}: {body}"));
+                        let is_retryable = status.as_u16() == 429 || status.is_server_error();
+                        if is_retryable && attempt < MAX_RETRIES - 1 {
+                            let delay = std::time::Duration::from_secs(2u64.pow(attempt));
+                            tokio::time::sleep(delay).await;
+                            continue;
+                        }
+                        return Err(last_err.unwrap());
+                    }
+                    let api_response: ApiResponse = response
+                        .json()
+                        .await
+                        .context("Failed to parse Claude API response")?;
+                    return api_response
+                        .content
+                        .first()
+                        .and_then(|b| b.text.clone())
+                        .context("Empty response from Claude API");
+                }
+                Err(e) => {
+                    last_err = Some(anyhow::anyhow!("Failed to send request to Claude API: {e}"));
+                    if attempt < MAX_RETRIES - 1 {
+                        warn!(attempt = attempt + 1, "Claude API request failed, retrying...");
+                        let delay = std::time::Duration::from_secs(2u64.pow(attempt));
+                        tokio::time::sleep(delay).await;
+                    } else {
+                        return Err(last_err.unwrap());
+                    }
+                }
+            }
         }
-
-        let api_response: ApiResponse = response
-            .json()
-            .await
-            .context("Failed to parse Claude API response")?;
-
-        api_response
-            .content
-            .first()
-            .and_then(|b| b.text.clone())
-            .context("Empty response from Claude API")
+        Err(last_err.unwrap())
     }
 }
 

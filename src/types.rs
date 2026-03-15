@@ -7,6 +7,7 @@ use uuid::Uuid;
 // ---------------------------------------------------------------------------
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[allow(clippy::upper_case_acronyms)]
 pub enum Symbol {
     BTC,
 }
@@ -247,6 +248,17 @@ pub struct TradeRecord {
     pub exit_reason: Option<String>,
     pub llm_reasoning: String,
     pub capital_after: Option<f64>,
+    /// Entry indicators for learning (RSI, CVD, OB, ATR%, BB pos)
+    #[serde(default)]
+    pub entry_rsi: Option<f64>,
+    #[serde(default)]
+    pub entry_cvd: Option<f64>,
+    #[serde(default)]
+    pub entry_ob: Option<f64>,
+    #[serde(default)]
+    pub entry_atr_pct: Option<f64>,
+    #[serde(default)]
+    pub entry_bb_position: Option<f64>,
 }
 
 // ---------------------------------------------------------------------------
@@ -270,6 +282,58 @@ pub struct ActiveTrade {
     pub llm_reasoning: String,
     pub signal_level: SignalLevel,
     pub signal_score: i32,
+    pub entry_rsi: Option<f64>,
+    pub entry_cvd: Option<f64>,
+    pub entry_ob: Option<f64>,
+    pub entry_atr_pct: Option<f64>,
+    pub entry_bb_position: Option<f64>,
+}
+
+impl ActiveTrade {
+    /// Compute realized PnL for closing at exit_price.
+    pub fn compute_pnl(&self, exit_price: f64) -> f64 {
+        if self.entry_price <= 0.0 {
+            return 0.0;
+        }
+        match self.direction {
+            Direction::Long => (exit_price - self.entry_price) / self.entry_price * self.size_usd,
+            Direction::Short => (self.entry_price - exit_price) / self.entry_price * self.size_usd,
+        }
+    }
+
+    /// Build a closed TradeRecord for journaling.
+    pub fn to_closed_record(
+        &self,
+        exit_price: f64,
+        exit_reason: &str,
+        pnl: f64,
+        capital_after: f64,
+    ) -> TradeRecord {
+        let now = chrono::Utc::now();
+        TradeRecord {
+            id: self.id,
+            ts_open: self.opened_at,
+            ts_close: Some(now),
+            duration_secs: Some((now - self.opened_at).num_seconds().max(0) as u64),
+            play_type: self.play_type,
+            direction: self.direction,
+            signal_level: self.signal_level,
+            signal_score: self.signal_score,
+            entry_price: self.entry_price,
+            exit_price: Some(exit_price),
+            size_usd: self.size_usd,
+            leverage: self.leverage,
+            pnl_usd: Some(pnl),
+            exit_reason: Some(exit_reason.to_string()),
+            llm_reasoning: self.llm_reasoning.clone(),
+            capital_after: Some(capital_after),
+            entry_rsi: self.entry_rsi,
+            entry_cvd: self.entry_cvd,
+            entry_ob: self.entry_ob,
+            entry_atr_pct: self.entry_atr_pct,
+            entry_bb_position: self.entry_bb_position,
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------

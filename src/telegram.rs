@@ -21,8 +21,8 @@ struct SendMessage {
 
 /// Escape special characters for Telegram MarkdownV2 parse mode.
 fn escape_md(text: &str) -> String {
-    let special = ['_', '*', '[', ']', '(', ')', '~', '`', '>', '#', '+', '-', '=', '|', '{', '}', '.', '!'];
-    let mut escaped = String::with_capacity(text.len());
+    let special = ['\\', '_', '*', '[', ']', '(', ')', '~', '`', '>', '#', '+', '-', '=', '|', '{', '}', '.', '!'];
+    let mut escaped = String::with_capacity(text.len() + text.len() / 4);
     for ch in text.chars() {
         if special.contains(&ch) {
             escaped.push('\\');

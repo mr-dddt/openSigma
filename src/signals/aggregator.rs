@@ -228,8 +228,8 @@ impl SignalAggregator {
         // Daily loss limit
         if self.daily_pnl_pct <= -config.capital.max_daily_loss_pct {
             return Some(format!(
-                "Daily loss {:.1}% >= limit {:.1}%",
-                self.daily_pnl_pct, config.capital.max_daily_loss_pct
+                "Daily loss {:.1}% hit -{:.1}% limit",
+                self.daily_pnl_pct.abs(), config.capital.max_daily_loss_pct
             ));
         }
 
@@ -259,13 +259,16 @@ impl SignalAggregator {
 use crate::config::SignalConfig;
 
 fn classify_level(net: i32, cfg: &SignalConfig) -> SignalLevel {
-    if net >= cfg.strong_threshold {
+    let strong = cfg.strong_threshold.max(2);
+    let lean = cfg.lean_threshold.max(1).min(strong - 1);
+
+    if net >= strong {
         SignalLevel::StrongLong
-    } else if net >= cfg.lean_threshold {
+    } else if net >= lean {
         SignalLevel::LeanLong
-    } else if net <= -cfg.strong_threshold {
+    } else if net <= -strong {
         SignalLevel::StrongShort
-    } else if net <= -cfg.lean_threshold {
+    } else if net <= -lean {
         SignalLevel::LeanShort
     } else {
         SignalLevel::Weak

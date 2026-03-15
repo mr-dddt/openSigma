@@ -45,9 +45,25 @@ pub struct Config {
 pub struct CapitalConfig {
     pub initial_usd: f64,
     pub max_trade_pct: f64,
+    #[serde(default = "default_strong_mult")]
+    pub strong_signal_size_mult: f64,
     pub max_concurrent_positions: u32,
     pub max_daily_loss_pct: f64,
     pub kill_switch_drawdown_pct: f64,
+    /// When false, auto kill switch is disabled — engine keeps trading through drawdowns (24/7 mode).
+    #[serde(default = "default_true")]
+    pub kill_switch_enabled: bool,
+    /// When true, reset kill switch at UTC midnight so trading resumes next day.
+    #[serde(default = "default_true")]
+    pub kill_switch_auto_reset: bool,
+}
+
+fn default_true() -> bool {
+    true
+}
+
+fn default_strong_mult() -> f64 {
+    1.5
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -115,16 +131,10 @@ pub struct TuningConfig {
 fn default_tune_trades() -> u64 { 20 }
 fn default_inactivity() -> u64 { 600 }
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Default, Deserialize)]
 pub struct TelegramConfig {
     #[serde(default)]
     pub enabled: bool,
-}
-
-impl Default for TelegramConfig {
-    fn default() -> Self {
-        Self { enabled: false }
-    }
 }
 
 impl Default for TuningConfig {
@@ -170,15 +180,14 @@ impl Config {
     /// Load tuned signal params from a separate file, overriding config.toml defaults.
     /// Silently skips if the file doesn't exist.
     pub fn load_tuned_signals(&mut self, path: &str) {
-        match std::fs::read_to_string(path) {
-            Ok(content) => match toml::from_str::<SignalConfig>(&content) {
+        if let Ok(content) = std::fs::read_to_string(path) {
+            match toml::from_str::<SignalConfig>(&content) {
                 Ok(tuned) => {
                     info!(path = path, "Loaded tuned signal params");
                     self.signals = tuned;
                 }
                 Err(e) => warn!("Failed to parse tuned signals from {path}: {e}"),
-            },
-            Err(_) => {} // File doesn't exist yet, use config.toml defaults
+            }
         }
     }
 
