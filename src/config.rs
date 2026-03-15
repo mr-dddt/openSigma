@@ -45,9 +45,16 @@ pub struct Config {
 pub struct CapitalConfig {
     pub initial_usd: f64,
     pub max_trade_pct: f64,
+    /// When signal is STRONG (StrongLong/StrongShort), size is multiplied by this (e.g. 1.5 = 50% more).
+    #[serde(default = "default_strong_signal_size_mult")]
+    pub strong_signal_size_mult: f64,
     pub max_concurrent_positions: u32,
     pub max_daily_loss_pct: f64,
     pub kill_switch_drawdown_pct: f64,
+}
+
+fn default_strong_signal_size_mult() -> f64 {
+    1.5
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -97,12 +104,35 @@ pub struct SignalConfig {
     pub rsi_oversold: f64,
     #[serde(default = "default_rsi_overbought")]
     pub rsi_overbought: f64,
+    /// Funding contributes to score only when absolute funding is meaningful.
+    #[serde(default = "default_funding_score_threshold")]
+    pub funding_score_threshold: f64,
+    /// Score weight for favorable/unfavorable funding.
+    #[serde(default = "default_1")]
+    pub funding_weight: i32,
+    /// Minimum absolute CVD change to count as momentum.
+    #[serde(default = "default_cvd_slope_threshold")]
+    pub cvd_slope_threshold: f64,
+    /// OB imbalance weak threshold (tier-1 scoring).
+    #[serde(default = "default_ob_lean_threshold")]
+    pub ob_lean_threshold: f64,
+    /// OB imbalance strong threshold (tier-2 scoring).
+    #[serde(default = "default_ob_strong_threshold")]
+    pub ob_strong_threshold: f64,
+    /// EMA spread threshold (%) for trend regime.
+    #[serde(default = "default_regime_trend_spread_pct")]
+    pub regime_trend_spread_pct: f64,
 }
 
 fn default_2() -> i32 { 2 }
 fn default_1() -> i32 { 1 }
 fn default_rsi_oversold() -> f64 { 35.0 }
 fn default_rsi_overbought() -> f64 { 65.0 }
+fn default_funding_score_threshold() -> f64 { 0.005 }
+fn default_cvd_slope_threshold() -> f64 { 30.0 }
+fn default_ob_lean_threshold() -> f64 { 1.3 }
+fn default_ob_strong_threshold() -> f64 { 2.0 }
+fn default_regime_trend_spread_pct() -> f64 { 0.05 }
 
 #[derive(Debug, Clone, Deserialize)]
 pub struct TuningConfig {

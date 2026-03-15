@@ -13,6 +13,8 @@ pub struct Indicators {
     cvd_buys: f64,
     cvd_sells: f64,
     cvd_reset_at: Option<chrono::DateTime<chrono::Utc>>,
+    /// Recent CVD snapshots for momentum (slope) estimation.
+    cvd_samples: VecDeque<f64>,
     /// Max candles to keep
     max_candles: usize,
 }
@@ -25,6 +27,7 @@ impl Indicators {
             cvd_buys: 0.0,
             cvd_sells: 0.0,
             cvd_reset_at: None,
+            cvd_samples: VecDeque::new(),
             max_candles: 200,
         }
     }
@@ -64,6 +67,10 @@ impl Indicators {
             self.cvd_buys += size;
         } else {
             self.cvd_sells += size;
+        }
+        self.cvd_samples.push_back(self.cvd());
+        if self.cvd_samples.len() > 60 {
+            self.cvd_samples.pop_front();
         }
     }
 
@@ -329,6 +336,15 @@ impl Indicators {
 
     pub fn cvd(&self) -> f64 {
         self.cvd_buys - self.cvd_sells
+    }
+
+    /// CVD momentum over recent samples.
+    pub fn cvd_slope(&self) -> Option<f64> {
+        if self.cvd_samples.len() < 6 {
+            return None;
+        }
+        let n = self.cvd_samples.len();
+        Some(self.cvd_samples[n - 1] - self.cvd_samples[n - 6])
     }
 
     /// CVD direction: positive = net buying, negative = net selling.

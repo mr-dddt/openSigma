@@ -1,7 +1,7 @@
 use chrono::{Datelike, Utc};
 use ratatui::{
     prelude::{Color, Constraint, Frame, Layout, Line, Rect, Span, Style, Stylize},
-    widgets::{Block, Borders, List, ListItem, Paragraph},
+    widgets::{Block, Borders, List, ListItem, Paragraph, Wrap},
 };
 use serde::{Deserialize, Serialize};
 
@@ -66,6 +66,7 @@ pub struct App {
     pub trade_log: Vec<String>,
     #[allow(dead_code)]
     pub initial_equity: f64,
+    #[allow(dead_code)]
     pub config_initial_usd: f64,
     pub equity: f64,
     pub total_pnl_pct: f64,
@@ -141,9 +142,9 @@ impl App {
     pub fn update_balances(&mut self, balances: ExchangeBalances) {
         self.balances = balances;
         self.equity = self.balances.hl_equity;
-        // Total PnL since inception (based on original capital from config)
-        if self.config_initial_usd > 0.0 {
-            self.total_pnl_pct = ((self.equity - self.config_initial_usd) / self.config_initial_usd) * 100.0;
+        // Total PnL % since bot start: use actual initial_equity (real balance at startup), not config
+        if self.initial_equity > 0.0 {
+            self.total_pnl_pct = ((self.equity - self.initial_equity) / self.initial_equity) * 100.0;
         }
         // Daily PnL (reset at UTC midnight, persisted to disk)
         let today = Utc::now().ordinal();
@@ -253,6 +254,21 @@ impl App {
                     ),
                 ]),
                 Line::from(vec![
+                    Span::styled(" Funding%:", Style::default().fg(Color::Cyan)),
+                    Span::raw(format!(" {}", format_funding(ind.funding_rate))),
+                    Span::styled("  CVDΔ:", Style::default().fg(Color::Cyan)),
+                    Span::raw(format!(" {}", format_cvd_delta(ind.cvd_slope))),
+                    Span::styled("  Regime:", Style::default().fg(Color::Cyan)),
+                    Span::styled(format!(" {}", regime_label(ind)), Style::default().fg(regime_color(ind))),
+                    Span::styled("  EMAΔ%:", Style::default().fg(Color::Cyan)),
+                    Span::raw(format!(
+                        " {}",
+                        ind.ema_spread_pct
+                            .map(|v| format!("{v:.3}"))
+                            .unwrap_or_else(|| "n/a".to_string())
+                    )),
+                ]),
+                Line::from(vec![
                     Span::styled(" Filter: ", Style::default().fg(Color::DarkGray)),
                     Span::styled(filter, Style::default().fg(if filter == "none" { Color::DarkGray } else { Color::Yellow })),
                 ]),
@@ -293,30 +309,32 @@ impl App {
     }
 
     fn render_log(&self, frame: &mut Frame, area: Rect) {
-        let log_items: Vec<ListItem> = self
-            .trade_log
-            .iter()
-            .rev()
-            .take(area.height.saturating_sub(2) as usize)
-            .map(|line| {
-                let color = if line.contains("EXECUTE") {
-                    Color::Green
-                } else if line.contains("SKIP") || line.contains("SECOND_LOOK") {
-                    Color::Yellow
-                } else if line.contains("KILL") || line.contains("Risk") {
-                    Color::Red
-                } else if line.contains("Report") || line.contains("Tune") {
-                    Color::Cyan
-                } else {
-                    Color::White
-                };
-                ListItem::new(Span::styled(line.as_str(), Style::default().fg(color)))
-            })
-            .collect();
+        let max_lines = area.height.saturating_sub(2) as usize;
+        let wrap_width = area.width.saturating_sub(4) as usize;
+        let mut rendered_lines: Vec<Line> = Vec::new();
 
-        let log_list = List::new(log_items)
-            .block(Block::default().borders(Borders::ALL).title(" Log ").border_style(Style::default().fg(Color::Cyan)));
-        frame.render_widget(log_list, area);
+        for raw_line in self.trade_log.iter().rev() {
+            if rendered_lines.len() >= max_lines {
+                break;
+            }
+            let color = log_color(raw_line);
+            for part in wrap_log_line(raw_line, wrap_width) {
+                if rendered_lines.len() >= max_lines {
+                    break;
+                }
+                rendered_lines.push(Line::from(Span::styled(part, Style::default().fg(color))));
+            }
+        }
+
+        let log_paragraph = Paragraph::new(rendered_lines)
+            .wrap(Wrap { trim: false })
+            .block(
+                Block::default()
+                    .borders(Borders::ALL)
+                    .title(" Log ")
+                    .border_style(Style::default().fg(Color::Cyan)),
+            );
+        frame.render_widget(log_paragraph, area);
     }
 
     fn render_footer(&self, frame: &mut Frame, area: Rect) {
@@ -403,4 +421,104 @@ fn bb_color(squeeze: bool, pos: f64) -> Color {
     } else {
         Color::DarkGray
     }
+}
+
+fn format_funding(funding: Option<f64>) -> String {
+    match funding {
+        Some(v) => {
+            let bps = v * 10_000.0;
+            format!("{v:+.6} ({bps:+.2}bps)")
+        }
+        None => "n/a".to_string(),
+    }
+}
+
+fn format_cvd_delta(cvd_delta: Option<f64>) -> String {
+    match cvd_delta {
+        Some(v) => {
+            let arrow = if v > 0.0 {
+                "↑"
+            } else if v < 0.0 {
+                "↓"
+            } else {
+                "→"
+            };
+            format!("{v:+.2}{arrow}")
+        }
+        None => "n/a".to_string(),
+    }
+}
+
+fn regime_label(ind: &crate::types::IndicatorValues) -> String {
+    let base = match ind.regime.as_deref() {
+        Some("trend_up") => "T↑",
+        Some("trend_down") => "T↓",
+        Some("range") => "RG",
+        _ => "n/a",
+    };
+    if ind.bb_squeeze {
+        format!("{base} {}", bb_label(ind.bb_squeeze, ind.bb_position.unwrap_or(0.0)))
+    } else {
+        base.to_string()
+    }
+}
+
+fn regime_color(ind: &crate::types::IndicatorValues) -> Color {
+    match ind.regime.as_deref() {
+        Some("trend_up") => Color::Green,
+        Some("trend_down") => Color::Red,
+        Some("range") => {
+            if ind.bb_squeeze {
+                Color::Yellow
+            } else {
+                Color::DarkGray
+            }
+        }
+        _ => Color::DarkGray,
+    }
+}
+
+fn log_color(line: &str) -> Color {
+    if line.contains("EXECUTE") {
+        Color::Green
+    } else if line.contains("SKIP") || line.contains("SECOND_LOOK") {
+        Color::Yellow
+    } else if line.contains("KILL") || line.contains("Risk") {
+        Color::Red
+    } else if line.contains("Report") || line.contains("Tune") {
+        Color::Cyan
+    } else {
+        Color::White
+    }
+}
+
+fn wrap_log_line(line: &str, width: usize) -> Vec<String> {
+    if width == 0 {
+        return Vec::new();
+    }
+    let mut out = Vec::new();
+    for raw in line.split('\n') {
+        let mut remaining = raw.trim_end();
+        while remaining.chars().count() > width {
+            let hard_idx = byte_index_at_char(remaining, width);
+            let split_idx = remaining[..hard_idx]
+                .rfind(|c: char| c.is_whitespace())
+                .filter(|idx| *idx > 0)
+                .unwrap_or(hard_idx);
+            let (head, tail) = remaining.split_at(split_idx);
+            out.push(head.trim_end().to_string());
+            remaining = tail.trim_start();
+        }
+        if !remaining.is_empty() {
+            out.push(remaining.to_string());
+        }
+    }
+    out
+}
+
+fn byte_index_at_char(s: &str, n_chars: usize) -> usize {
+    s.char_indices()
+        .nth(n_chars)
+        .map(|(idx, _)| idx)
+        .unwrap_or(s.len())
 }

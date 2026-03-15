@@ -165,8 +165,12 @@ pub struct IndicatorValues {
     pub bb_bandwidth: Option<f64>,
     pub atr_14: Option<f64>,
     pub atr_pct: Option<f64>,
+    pub funding_rate: Option<f64>,
     pub cvd: Option<f64>,
+    pub cvd_slope: Option<f64>,
     pub ob_imbalance: Option<f64>,
+    pub regime: Option<String>,
+    pub ema_spread_pct: Option<f64>,
 }
 
 // ---------------------------------------------------------------------------
@@ -175,13 +179,14 @@ pub struct IndicatorValues {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub enum PlayType {
-    PurePerpScalp,
+    #[serde(rename = "BTCPerpScalp", alias = "PurePerpScalp")]
+    BTCPerpScalp,
 }
 
 impl std::fmt::Display for PlayType {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            PlayType::PurePerpScalp => write!(f, "PurePerpScalp"),
+            PlayType::BTCPerpScalp => write!(f, "BTCPerpScalp"),
         }
     }
 }
@@ -247,6 +252,17 @@ pub struct TradeRecord {
     pub exit_reason: Option<String>,
     pub llm_reasoning: String,
     pub capital_after: Option<f64>,
+    /// Entry indicators for learning/tuning (RSI, CVD, OB, ATR%, BB pos)
+    #[serde(default)]
+    pub entry_rsi: Option<f64>,
+    #[serde(default)]
+    pub entry_cvd: Option<f64>,
+    #[serde(default)]
+    pub entry_ob: Option<f64>,
+    #[serde(default)]
+    pub entry_atr_pct: Option<f64>,
+    #[serde(default)]
+    pub entry_bb_position: Option<f64>,
 }
 
 // ---------------------------------------------------------------------------
@@ -270,6 +286,11 @@ pub struct ActiveTrade {
     pub llm_reasoning: String,
     pub signal_level: SignalLevel,
     pub signal_score: i32,
+    pub entry_rsi: Option<f64>,
+    pub entry_cvd: Option<f64>,
+    pub entry_ob: Option<f64>,
+    pub entry_atr_pct: Option<f64>,
+    pub entry_bb_position: Option<f64>,
 }
 
 // ---------------------------------------------------------------------------

@@ -10,7 +10,9 @@ use hyperliquid_rust_sdk::{
 
 /// Lightweight account state query — no signing needed, just reads.
 /// Used by the balance poller task which doesn't need order execution.
-pub async fn query_account_state(wallet_address: ethers::types::Address) -> Result<(f64, f64, Vec<HlPosition>)> {
+/// Returns: (equity_for_risk, total_balance_display, available_balance_display, positions).
+/// HL Balances tab: Total Balance = total_balance_display, Available Balance = available_balance_display.
+pub async fn query_account_state(wallet_address: ethers::types::Address) -> Result<(f64, f64, f64, Vec<HlPosition>)> {
     let info = InfoClient::new(None, Some(BaseUrl::Mainnet))
         .await
         .map_err(|e| anyhow::anyhow!("Failed to create InfoClient: {e:?}"))?;
@@ -38,11 +40,8 @@ pub async fn query_account_state(wallet_address: ethers::types::Address) -> Resu
         })
         .collect();
 
-    let unrealized_pnl: f64 = positions.iter().map(|p| p.unrealized_pnl).sum();
-
-    // Spot clearinghouse: total USDC and available (total - hold).
-    // On unified accounts, all USDC lives in spot — perp withdrawable is 0.
-    let (spot_total, spot_available) = match info.user_token_balances(wallet_address).await {
+    // HL Balances tab: Total Balance & Available Balance come from user_token_balances (USDC).
+    let (total_balance, available_balance) = match info.user_token_balances(wallet_address).await {
         Ok(balances) => {
             let usdc = balances.balances.iter().find(|b| b.coin == "USDC");
             let total = usdc.and_then(|b| b.total.parse::<f64>().ok()).unwrap_or(0.0);
@@ -50,13 +49,16 @@ pub async fn query_account_state(wallet_address: ethers::types::Address) -> Resu
             (total, total - hold)
         }
         Err(e) => {
-            warn!("Failed to query spot balances: {e:?}");
+            warn!("user_token_balances failed: {e:?}");
             (0.0, 0.0)
         }
     };
 
-    let total_equity = spot_total + unrealized_pnl;
-    Ok((total_equity, spot_available, positions))
+    // Equity for risk/sizing and heat calculations should reflect deployable wallet capital,
+    // not isolated per-position account value. Use HL Balances "Total Balance" (USDC total).
+    let equity_for_risk = total_balance;
+
+    Ok((equity_for_risk, total_balance, available_balance, positions))
 }
 
 /// Hyperliquid order executor — uses the official SDK for proper EIP-712 signing.
@@ -213,48 +215,6 @@ impl HlExecutor {
             .collect();
 
         Ok(positions)
-    }
-
-    /// Query total account equity: perp clearinghouse + spot USDC balance.
-    /// Unified accounts keep most USDC in the spot clearinghouse while using
-    /// it as perp collateral, so we must query both.
-    pub async fn account_equity(&self) -> Result<f64> {
-        let info = InfoClient::new(None, Some(BaseUrl::Mainnet))
-            .await
-            .map_err(|e| anyhow::anyhow!("Failed to create InfoClient: {e:?}"))?;
-
-        // Perp clearinghouse: margin + unrealized PnL
-        // Unrealized PnL from perp positions
-        let unrealized_pnl = match info.user_state(self.wallet.address()).await {
-            Ok(state) => state
-                .asset_positions
-                .iter()
-                .map(|p| p.position.unrealized_pnl.parse::<f64>().unwrap_or(0.0))
-                .sum::<f64>(),
-            Err(e) => {
-                warn!("Failed to query perp state: {e:?}");
-                0.0
-            }
-        };
-
-        // Spot clearinghouse: USDC balance (unified accounts store all funds here,
-        // including margin allocated to perps — so don't add perp accountValue)
-        let spot_usdc = match info.user_token_balances(self.wallet.address()).await {
-            Ok(balances) => balances
-                .balances
-                .iter()
-                .find(|b| b.coin == "USDC")
-                .and_then(|b| b.total.parse::<f64>().ok())
-                .unwrap_or(0.0),
-            Err(e) => {
-                warn!("Failed to query spot balances: {e:?}");
-                0.0
-            }
-        };
-
-        let total = spot_usdc + unrealized_pnl;
-        info!(spot_usdc, unrealized_pnl, total, "HL account equity");
-        Ok(total)
     }
 
     /// Close all positions (market sell/buy to flatten).

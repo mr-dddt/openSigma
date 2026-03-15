@@ -85,6 +85,8 @@ impl SignalAggregator {
         let mut indicators = IndicatorValues::default();
 
         let sig = &config.signals;
+        let funding = self.latest_funding;
+        indicators.funding_rate = Some(funding);
 
         // --- EMA(9, 21) cross [configurable weight] ---
         let ema_9 = self.indicators.ema_9();
@@ -110,20 +112,43 @@ impl SignalAggregator {
             }
         }
 
-        // --- CVD 5m [configurable weight] ---
+        // --- CVD 5m [configurable weight + slope/momentum] ---
         let cvd = self.indicators.cvd();
         indicators.cvd = Some(cvd);
+        let cvd_slope = self.indicators.cvd_slope();
+        indicators.cvd_slope = cvd_slope;
         if cvd > 0.0 {
             bull += sig.cvd_weight;
         } else if cvd < 0.0 {
             bear += sig.cvd_weight;
         }
+        if let Some(slope) = cvd_slope {
+            if slope >= sig.cvd_slope_threshold {
+                bull += 1;
+            } else if slope <= -sig.cvd_slope_threshold {
+                bear += 1;
+            }
+        }
 
-        // --- Order Book Imbalance [configurable weight] ---
+        // --- Funding score layer (in addition to hard filter) ---
+        if funding.abs() >= sig.funding_score_threshold {
+            // Negative funding favors longs, positive funding favors shorts.
+            if funding < 0.0 {
+                bull += sig.funding_weight;
+            } else if funding > 0.0 {
+                bear += sig.funding_weight;
+            }
+        }
+
+        // --- Order Book Imbalance (tiered scoring) ---
         indicators.ob_imbalance = Some(self.latest_ob_imbalance);
-        if self.latest_ob_imbalance > 2.0 {
+        if self.latest_ob_imbalance >= sig.ob_strong_threshold {
+            bull += sig.ob_weight + 1;
+        } else if self.latest_ob_imbalance >= sig.ob_lean_threshold {
             bull += sig.ob_weight;
-        } else if self.latest_ob_imbalance < 0.5 {
+        } else if self.latest_ob_imbalance <= (1.0 / sig.ob_strong_threshold.max(1.01)) {
+            bear += sig.ob_weight + 1;
+        } else if self.latest_ob_imbalance <= (1.0 / sig.ob_lean_threshold.max(1.01)) {
             bear += sig.ob_weight;
         }
 
@@ -166,6 +191,28 @@ impl SignalAggregator {
                     bull += 1;
                 } else if pos < -1.0 {
                     bear += 1;
+                }
+            }
+        }
+
+        // --- Regime bias: trend-follow when EMA spread is meaningful ---
+        if let (Some(e9), Some(e21)) = (ema_9, ema_21) {
+            if self.latest_price > 0.0 {
+                let spread_pct = ((e9 - e21).abs() / self.latest_price) * 100.0;
+                indicators.ema_spread_pct = Some(spread_pct);
+                if spread_pct >= sig.regime_trend_spread_pct {
+                    indicators.regime = Some(if e9 > e21 {
+                        "trend_up".to_string()
+                    } else {
+                        "trend_down".to_string()
+                    });
+                    if e9 > e21 {
+                        bull += 1;
+                    } else if e9 < e21 {
+                        bear += 1;
+                    }
+                } else {
+                    indicators.regime = Some("range".to_string());
                 }
             }
         }
@@ -238,7 +285,7 @@ impl SignalAggregator {
             return Some("Kill switch triggered".into());
         }
 
-        // Funding rate in same direction as signal
+        // Funding rate hard filter in same direction as signal
         if net_score > 0 && self.latest_funding > config.signals.max_funding_same_dir {
             return Some(format!(
                 "Funding {:.4}% in long direction",

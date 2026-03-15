@@ -176,23 +176,29 @@ async fn main() -> Result<()> {
             None
         }
     };
-    // Fetch real exchange balance at startup for accurate daily PnL tracking.
-    // Falls back to config.capital.initial_usd if exchange queries fail.
-    let startup_hl_equity = if let Some(ref hl) = hl_executor {
-        hl.account_equity().await.unwrap_or(0.0)
-    } else {
-        0.0
+    // Fetch startup account state once so risk baseline and TUI baseline are consistent.
+    // - `initial_usd` (risk): equity_for_risk (account_value when available)
+    // - `initial_tui_equity` (display): total_balance from HL Balances tab (USDC total)
+    let startup_state = match secrets.hl_private_key.parse::<ethers::signers::LocalWallet>() {
+        Ok(w) => query_account_state(w.address()).await.ok(),
+        Err(_) => None,
     };
-    let initial_usd = {
-        let real = startup_hl_equity;
-        if real > 0.0 {
-            info!(real_balance = real, "Using real exchange balance as starting equity");
-            real
-        } else {
-            warn!("Could not fetch exchange balance, falling back to config initial_usd");
+
+    let initial_usd = startup_state
+        .as_ref()
+        .map(|(equity_for_risk, _, _, _)| *equity_for_risk)
+        .filter(|v| *v > 0.0)
+        .unwrap_or_else(|| {
+            warn!("Could not fetch startup risk equity, falling back to config initial_usd");
             config.capital.initial_usd
-        }
-    };
+        });
+    info!(real_balance = initial_usd, "Using startup risk equity baseline");
+
+    let initial_tui_equity = startup_state
+        .as_ref()
+        .map(|(_, total_balance, _, _)| *total_balance)
+        .filter(|v| *v > 0.0)
+        .unwrap_or(initial_usd);
     let mut risk = RiskChecker::new(initial_usd);
 
     // Restore stats from journal history
@@ -219,7 +225,7 @@ async fn main() -> Result<()> {
                         id: Uuid::new_v4(),
                         symbol: Symbol::BTC,
                         direction,
-                        play_type: PlayType::PurePerpScalp,
+                        play_type: PlayType::BTCPerpScalp,
                         entry_price: pos.entry_px,
                         size_usd,
                         leverage: Some(pos.leverage),
@@ -227,10 +233,14 @@ async fn main() -> Result<()> {
                         take_profit_pct: recovered_tp,
                         opened_at: chrono::Utc::now(),
                         max_hold_secs: config.execution.max_trade_duration_secs,
-
                         llm_reasoning: "Recovered from previous session".to_string(),
                         signal_level: SignalLevel::Weak,
                         signal_score: 0,
+                        entry_rsi: None,
+                        entry_cvd: None,
+                        entry_ob: None,
+                        entry_atr_pct: None,
+                        entry_bb_position: None,
                     };
                     info!(
                         coin = %pos.coin, direction = %direction,
@@ -293,13 +303,11 @@ async fn main() -> Result<()> {
             loop {
                 interval.tick().await;
 
-                // Query HL via SDK: total equity, available USDC, and all positions
+                // Query HL via SDK: equity for risk, total/available for display (HL Balances tab)
                 match query_account_state(wallet_address).await {
-                    Ok((hl_equity, hl_available, positions)) => {
-                        let total = hl_equity;
-
-                        // Update shared state for engine
-                        *bal_write.write().await = total;
+                    Ok((equity_for_risk, total_balance, available_balance, positions)) => {
+                        // Update shared state for engine (risk/sizing uses equity including unrealized PnL)
+                        *bal_write.write().await = equity_for_risk;
                         *pos_write.write().await = positions.clone();
 
                         // Convert HL positions to TUI format
@@ -316,9 +324,10 @@ async fn main() -> Result<()> {
                         }).collect();
 
                         let _ = tui_tx_bal.send(TuiUpdate::Positions(tui_positions)).await;
+                        // TUI: HL = Total Balance, Free = Available Balance (from HL Balances tab)
                         let _ = tui_tx_bal.send(TuiUpdate::Balances(ExchangeBalances {
-                            hl_equity,
-                            hl_available,
+                            hl_equity: total_balance,
+                            hl_available: available_balance,
                         })).await;
                     }
                     Err(e) => {
@@ -362,6 +371,19 @@ async fn main() -> Result<()> {
                                             PositionEvent::TakeProfitHit(_) => "take_profit",
                                             _ => "unknown",
                                         };
+                                        if let Some(trade_snapshot) = position_monitor.get_trade(&id) {
+                                            if let Err(e) = close_trade_on_exchange(&trade_snapshot, &hl_executor).await {
+                                                let _ = tui_tx_clone.send(TuiUpdate::Log(format!(
+                                                    "[{}] Close failed ({}) {} {}: {} — still open",
+                                                    chrono::Utc::now().format("%H:%M:%S"),
+                                                    reason,
+                                                    trade_snapshot.symbol,
+                                                    trade_snapshot.direction,
+                                                    e,
+                                                ))).await;
+                                                continue;
+                                            }
+                                        }
                                         if let Some(trade) = position_monitor.remove_trade(&id) {
                                             let exit_price = latest_price;
                                             let pnl = match trade.direction {
@@ -377,7 +399,11 @@ async fn main() -> Result<()> {
                                                 id: trade.id,
                                                 ts_open: trade.opened_at,
                                                 ts_close: Some(chrono::Utc::now()),
-                                                duration_secs: Some((chrono::Utc::now() - trade.opened_at).num_seconds() as u64),
+                                                duration_secs: Some(
+                                                    (chrono::Utc::now() - trade.opened_at)
+                                                        .num_seconds()
+                                                        .max(0) as u64,
+                                                ),
                                                 play_type: trade.play_type,
                                                 direction: trade.direction,
                                                 signal_level: trade.signal_level,
@@ -390,6 +416,11 @@ async fn main() -> Result<()> {
                                                 exit_reason: Some(reason.to_string()),
                                                 llm_reasoning: trade.llm_reasoning.clone(),
                                                 capital_after: Some(risk.current_equity()),
+                                                entry_rsi: trade.entry_rsi,
+                                                entry_cvd: trade.entry_cvd,
+                                                entry_ob: trade.entry_ob,
+                                                entry_atr_pct: trade.entry_atr_pct,
+                                                entry_bb_position: trade.entry_bb_position,
                                             };
                                             let _ = journal.log_entry(&record);
 
@@ -457,14 +488,21 @@ async fn main() -> Result<()> {
                     // Check position expirations (max hold time)
                     let expired = position_monitor.check_expirations();
                     for id in expired {
+                        if let Some(trade_snapshot) = position_monitor.get_trade(&id) {
+                            if let Err(e) = close_trade_on_exchange(&trade_snapshot, &hl_executor).await {
+                                let _ = tui_tx_clone.send(TuiUpdate::Log(format!(
+                                    "[{}] Expire close failed {} {}: {} — still open",
+                                    chrono::Utc::now().format("%H:%M:%S"),
+                                    trade_snapshot.symbol,
+                                    trade_snapshot.direction,
+                                    e,
+                                ))).await;
+                                continue;
+                            }
+                        }
                         if let Some(trade) = position_monitor.remove_trade(&id) {
                             info!(id = %trade.id, symbol = %trade.symbol, "Position expired (max hold time)");
                             let current_price = latest_price;
-                            if let Some(ref hl) = hl_executor {
-                                let is_buy = trade.direction == Direction::Short;
-                                let sz = trade.size_usd / trade.entry_price;
-                                let _ = hl.market_order(trade.symbol.hl_coin(), is_buy, sz, trade.leverage.unwrap_or(1)).await;
-                            }
                             let pnl = match trade.direction {
                                 Direction::Long => (current_price - trade.entry_price) / trade.entry_price * trade.size_usd,
                                 Direction::Short => (trade.entry_price - current_price) / trade.entry_price * trade.size_usd,
@@ -479,7 +517,11 @@ async fn main() -> Result<()> {
                                 id: trade.id,
                                 ts_open: trade.opened_at,
                                 ts_close: Some(chrono::Utc::now()),
-                                duration_secs: Some((chrono::Utc::now() - trade.opened_at).num_seconds() as u64),
+                                duration_secs: Some(
+                                    (chrono::Utc::now() - trade.opened_at)
+                                        .num_seconds()
+                                        .max(0) as u64,
+                                ),
                                 play_type: trade.play_type,
                                 direction: trade.direction,
                                 signal_level: trade.signal_level,
@@ -492,6 +534,11 @@ async fn main() -> Result<()> {
                                 exit_reason: Some("expired".to_string()),
                                 llm_reasoning: trade.llm_reasoning.clone(),
                                 capital_after: Some(risk.current_equity()),
+                                entry_rsi: trade.entry_rsi,
+                                entry_cvd: trade.entry_cvd,
+                                entry_ob: trade.entry_ob,
+                                entry_atr_pct: trade.entry_atr_pct,
+                                entry_bb_position: trade.entry_bb_position,
                             };
                             let _ = journal.log_entry(&record);
 
@@ -641,8 +688,26 @@ async fn main() -> Result<()> {
                         if is_trade_count {
                             let recent = journal.read_recent(20).unwrap_or_default();
                             if !recent.is_empty() {
-                                match reporter.generate(&recent, &memory).await {
+                                let params_str = {
+                                    let c = config_for_engine.read().await;
+                                    format!(
+                                        "strong_threshold={} lean_threshold={} min_atr_pct={} rsi_oversold={} rsi_overbought={}",
+                                        c.signals.strong_threshold,
+                                        c.signals.lean_threshold,
+                                        c.signals.min_atr_pct,
+                                        c.signals.rsi_oversold,
+                                        c.signals.rsi_overbought,
+                                    )
+                                };
+                                match reporter.generate(&recent, &memory, &params_str).await {
                                     Ok(result) => {
+                                        if !result.param_adjustments.is_empty() {
+                                            let mut cfg_write = config_for_engine.write().await;
+                                            crate::journal::reporter::apply_param_adjustments(&mut cfg_write, &result.param_adjustments);
+                                            if let Err(e) = cfg_write.save_signals("data/tuned_signals.toml") {
+                                                tracing::warn!("Failed to persist tuned signals after report: {e:#}");
+                                            }
+                                        }
                                         let _ = tui_tx_clone.send(TuiUpdate::Log(format!(
                                             "[{}] Report generated: {}",
                                             chrono::Utc::now().format("%H:%M:%S"),
@@ -703,7 +768,11 @@ async fn main() -> Result<()> {
     });
 
     // TUI on main thread
-    let mut app = App::new(initial_usd, config.capital.initial_usd, config.capital.max_concurrent_positions);
+    let mut app = App::new(
+        initial_tui_equity,
+        config.capital.initial_usd,
+        config.capital.max_concurrent_positions,
+    );
 
     crossterm::terminal::enable_raw_mode()?;
     std::io::stdout().execute(crossterm::terminal::EnterAlternateScreen)?;
@@ -807,12 +876,19 @@ async fn handle_llm_decision(
                 ))).await;
 
                 for opp_id in &opposite_ids {
-                    if let Some(opp_trade) = position_monitor.remove_trade(opp_id) {
-                        if let Some(ref hl) = hl_executor {
-                            let is_buy = opp_trade.direction == Direction::Short;
-                            let sz = opp_trade.size_usd / opp_trade.entry_price;
-                            let _ = hl.market_order("BTC", is_buy, sz, opp_trade.leverage.unwrap_or(1)).await;
+                    if let Some(opp_trade) = position_monitor.get_trade(opp_id) {
+                        if let Err(e) = close_trade_on_exchange(&opp_trade, hl_executor).await {
+                            let _ = tui_tx.send(TuiUpdate::Log(format!(
+                                "[{}] Close failed before reverse ({}): {} — keep position",
+                                chrono::Utc::now().format("%H:%M:%S"),
+                                opp_trade.direction,
+                                e,
+                            ))).await;
+                            return;
                         }
+                        let Some(opp_trade) = position_monitor.remove_trade(opp_id) else {
+                            continue;
+                        };
                         let current_price = latest_price;
                         // size_usd is notional (margin × leverage), so no extra lev multiplier
                         let pnl = match opp_trade.direction {
@@ -824,7 +900,11 @@ async fn handle_llm_decision(
                             id: opp_trade.id,
                             ts_open: opp_trade.opened_at,
                             ts_close: Some(chrono::Utc::now()),
-                            duration_secs: Some((chrono::Utc::now() - opp_trade.opened_at).num_seconds() as u64),
+                            duration_secs: Some(
+                                (chrono::Utc::now() - opp_trade.opened_at)
+                                    .num_seconds()
+                                    .max(0) as u64,
+                            ),
                             play_type: opp_trade.play_type,
                             direction: opp_trade.direction,
                             signal_level: opp_trade.signal_level,
@@ -837,6 +917,11 @@ async fn handle_llm_decision(
                             exit_reason: Some("reversed".to_string()),
                             llm_reasoning: opp_trade.llm_reasoning.clone(),
                             capital_after: Some(risk.current_equity()),
+                            entry_rsi: opp_trade.entry_rsi,
+                            entry_cvd: opp_trade.entry_cvd,
+                            entry_ob: opp_trade.entry_ob,
+                            entry_atr_pct: opp_trade.entry_atr_pct,
+                            entry_bb_position: opp_trade.entry_bb_position,
                         };
                         let _ = journal.log_entry(&record);
                         let _ = tui_tx.send(TuiUpdate::Log(format!(
@@ -850,7 +935,12 @@ async fn handle_llm_decision(
             }
 
             let (_in_session, size_mult) = config.active_session();
-            let size_usd = risk.max_trade_usd(config) * (size_pct / config.capital.max_trade_pct) * size_mult;
+            let base_size = risk.max_trade_usd(config) * (size_pct / config.capital.max_trade_pct) * size_mult;
+            let size_usd = if matches!(snapshot.level, SignalLevel::StrongLong | SignalLevel::StrongShort) {
+                base_size * config.capital.strong_signal_size_mult
+            } else {
+                base_size
+            };
             let leverage = hl_leverage.unwrap_or(1);
 
             info!(
@@ -906,6 +996,7 @@ async fn handle_llm_decision(
 
             // Track position (size_usd = notional, must match the actual HL order)
             let notional_usd = (size_usd * leverage as f64).max(10.5);
+            let ind = &snapshot.indicators;
             let trade = ActiveTrade {
                 id: Uuid::new_v4(),
                 symbol: Symbol::BTC,
@@ -921,6 +1012,11 @@ async fn handle_llm_decision(
                 llm_reasoning: reasoning.clone(),
                 signal_level: snapshot.level,
                 signal_score: snapshot.net_score,
+                entry_rsi: ind.rsi_14,
+                entry_cvd: ind.cvd,
+                entry_ob: ind.ob_imbalance,
+                entry_atr_pct: ind.atr_pct,
+                entry_bb_position: ind.bb_position,
             };
             let trade_id = trade.id;
             let trade_opened_at = trade.opened_at;
@@ -946,6 +1042,11 @@ async fn handle_llm_decision(
                 exit_reason: None,
                 llm_reasoning: reasoning.clone(),
                 capital_after: None,
+                entry_rsi: ind.rsi_14,
+                entry_cvd: ind.cvd,
+                entry_ob: ind.ob_imbalance,
+                entry_atr_pct: ind.atr_pct,
+                entry_bb_position: ind.bb_position,
             };
             let _ = journal.log_entry(&open_record);
 
@@ -1076,4 +1177,34 @@ fn build_position_context(
     lines.push("Positions (from HL):".to_string());
     lines.extend(position_lines);
     lines.join("\n")
+}
+
+/// Close a tracked trade on exchange. Returns error if order failed, so caller
+/// can keep local state consistent (do NOT mark closed unless exchange close succeeds).
+async fn close_trade_on_exchange(
+    trade: &ActiveTrade,
+    hl_executor: &Option<HlExecutor>,
+) -> Result<(), String> {
+    if let Some(hl) = hl_executor {
+        let is_buy = trade.direction == Direction::Short;
+        let sz = trade.size_usd / trade.entry_price;
+        if sz <= 0.0 {
+            return Err(format!("invalid close size {:.8}", sz));
+        }
+        match hl
+            .market_order(
+                trade.symbol.hl_coin(),
+                is_buy,
+                sz,
+                trade.leverage.unwrap_or(1),
+            )
+            .await
+        {
+            Ok(r) if r.success => Ok(()),
+            Ok(r) => Err(format!("order rejected: {}", r.message)),
+            Err(e) => Err(format!("{e:#}")),
+        }
+    } else {
+        Ok(())
+    }
 }

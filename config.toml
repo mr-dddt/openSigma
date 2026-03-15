@@ -1,6 +1,8 @@
 [capital]
 initial_usd = 50.0
 max_trade_pct = 10.0
+# Aggressive preset: STRONG signal can deploy more capital
+strong_signal_size_mult = 1.8
 max_concurrent_positions = 10
 max_daily_loss_pct = 10.0
 kill_switch_drawdown_pct = 20.0
@@ -33,18 +35,24 @@ model = "claude-sonnet-4-20250514"
 timeout_ms = 8000
 
 [signals]
-strong_threshold = 5
-lean_threshold = 3
-min_atr_pct = 0.05
-max_funding_same_dir = 0.03
+strong_threshold = 4
+lean_threshold = 2
+min_atr_pct = 0.035
+max_funding_same_dir = 0.06
 # Tunable indicator weights (LLM can adjust at runtime)
 ema_cross_weight = 2
-cvd_weight = 2
+cvd_weight = 3
 rsi_weight = 1
-ob_weight = 1
+ob_weight = 2
 stoch_rsi_weight = 1
-rsi_oversold = 35.0
-rsi_overbought = 65.0
+rsi_oversold = 40.0
+rsi_overbought = 60.0
+funding_score_threshold = 0.002
+funding_weight = 1
+cvd_slope_threshold = 15.0
+ob_lean_threshold = 1.2
+ob_strong_threshold = 1.7
+regime_trend_spread_pct = 0.03
 
 [tuning]
 tune_every_n_trades = 20

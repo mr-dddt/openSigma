@@ -13,7 +13,7 @@ const SYSTEM_PROMPT: &str = r#"You are openSigma, an aggressive short-term scalp
 Respond with ONLY a valid JSON object — one of three variants:
 
 1. Execute (example):
-{"Execute":{"play_type":"PurePerpScalp","direction":"Long","size_pct":8.0,"hl_leverage":30,"stop_loss_pct":0.08,"take_profit_pct":0.15,"reasoning":"Strong EMA cross with CVD confirmation"}}
+{"Execute":{"play_type":"BTCPerpScalp","direction":"Long","size_pct":8.0,"hl_leverage":30,"stop_loss_pct":0.08,"take_profit_pct":0.15,"reasoning":"Strong EMA cross with CVD confirmation"}}
 
 2. Skip:
 {"Skip":{"reasoning":"Indicators conflicting"}}
@@ -95,7 +95,7 @@ impl LlmGate {
         format!(
             "Signal: {} (net_score={}, bull={}, bear={})\n\
              EMA9={:.1} EMA21={:.1} RSI={:.1} StochRSI={:.1}\n\
-             CVD={:.2} OB_Imbalance={:.2} ATR%={:.3}\n\
+             CVD={:.2} OB_Imbalance={:.2} ATR%={:.3} Funding%={:.4}\n\
              BB: {}\n\
              Session: {} (size_mult={:.1})\n\
              Config: max_trade_pct={:.1}, max_leverage={}, max_duration={}s\n\
@@ -112,6 +112,7 @@ impl LlmGate {
             ind.cvd.unwrap_or(0.0),
             ind.ob_imbalance.unwrap_or(1.0),
             ind.atr_pct.unwrap_or(0.0),
+            ind.funding_rate.unwrap_or(0.0),
             bb_state,
             if in_session { "active" } else { "inactive" },
             size_mult,

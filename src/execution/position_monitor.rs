@@ -36,6 +36,11 @@ impl PositionMonitor {
         }
     }
 
+    /// Get a cloned snapshot of a tracked trade without removing it.
+    pub fn get_trade(&self, id: &Uuid) -> Option<ActiveTrade> {
+        self.active_trades.iter().find(|t| t.id == *id).cloned()
+    }
+
     /// Check all positions for max-hold timeout. Returns IDs of trades to close.
     pub fn check_expirations(&self) -> Vec<Uuid> {
         let now = Utc::now();
