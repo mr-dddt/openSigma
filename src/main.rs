@@ -773,7 +773,6 @@ async fn main() -> Result<()> {
     let mut app = App::new(
         initial_tui_equity,
         config.capital.initial_usd,
-        config.capital.max_concurrent_positions,
     );
 
     crossterm::terminal::enable_raw_mode()?;

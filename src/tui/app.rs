@@ -73,7 +73,6 @@ pub struct App {
     pub daily_pnl_pct: f64,
     start_of_day_equity: f64,
     current_day: u32,
-    pub max_positions: u32,
     // Phase 3 additions
     pub positions: Vec<PositionInfo>,
     pub stats: PerformanceStats,
@@ -81,7 +80,7 @@ pub struct App {
 }
 
 impl App {
-    pub fn new(initial_equity: f64, config_initial_usd: f64, max_positions: u32) -> Self {
+    pub fn new(initial_equity: f64, config_initial_usd: f64) -> Self {
         let today = Utc::now().ordinal();
         let start_of_day_equity = match load_daily_state() {
             Some(state) if state.date == Utc::now().format("%Y-%m-%d").to_string() => {
@@ -104,7 +103,6 @@ impl App {
             daily_pnl_pct: 0.0,
             start_of_day_equity,
             current_day: today,
-            max_positions,
             positions: Vec::new(),
             stats: PerformanceStats::default(),
             balances: ExchangeBalances::default(),
@@ -302,7 +300,7 @@ impl App {
     }
 
     fn render_positions(&self, frame: &mut Frame, area: Rect) {
-        let title = format!(" Positions [{}/{}] ", self.positions.len(), self.max_positions);
+        let title = format!(" Positions [{}] ", self.positions.len());
         let items: Vec<ListItem> = if self.positions.is_empty() {
             vec![ListItem::new(Span::styled("  No active positions", Style::default().fg(Color::DarkGray)))]
         } else {
