@@ -113,6 +113,30 @@ impl SignalTuner {
                 "vwap_weight" => {
                     config.signals.vwap_weight = clamped.max(0.0) as i32;
                 }
+                "funding_weight" => {
+                    config.signals.funding_weight = clamped as i32;
+                }
+                "delta_div_weight" => {
+                    config.signals.delta_div_weight = clamped as i32;
+                }
+                "oi_weight" => {
+                    config.signals.oi_weight = clamped as i32;
+                }
+                "ob_lean_threshold" => {
+                    config.signals.ob_lean_threshold = clamped;
+                }
+                "ob_strong_threshold" => {
+                    config.signals.ob_strong_threshold = clamped;
+                }
+                "regime_trend_spread_pct" => {
+                    config.signals.regime_trend_spread_pct = clamped;
+                }
+                "oi_delta_min_pct" => {
+                    config.signals.oi_delta_min_pct = clamped;
+                }
+                "cvd_slope_threshold" => {
+                    config.signals.cvd_slope_threshold = clamped;
+                }
                 other => {
                     warn!(param = other, "Unknown tune parameter, ignoring");
                 }
@@ -151,6 +175,14 @@ fn clamp_adjustment(adj: &TuneAdjustment, signals: &crate::config::SignalConfig)
         "min_atr_pct" => (signals.min_atr_pct, 0.02),
         "vwap_dev_reversion_pct" => (signals.vwap_dev_reversion_pct, 0.1),
         "vwap_weight" => (signals.vwap_weight as f64, 1.0),
+        "funding_weight" => (signals.funding_weight as f64, 1.0),
+        "delta_div_weight" => (signals.delta_div_weight as f64, 1.0),
+        "oi_weight" => (signals.oi_weight as f64, 1.0),
+        "ob_lean_threshold" => (signals.ob_lean_threshold, 0.3),
+        "ob_strong_threshold" => (signals.ob_strong_threshold, 0.3),
+        "regime_trend_spread_pct" => (signals.regime_trend_spread_pct, 0.02),
+        "oi_delta_min_pct" => (signals.oi_delta_min_pct, 0.02),
+        "cvd_slope_threshold" => (signals.cvd_slope_threshold, 5.0),
         _ => return adj.new_value,
     };
 

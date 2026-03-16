@@ -5,9 +5,7 @@ use ratatui::{
 };
 use serde::{Deserialize, Serialize};
 
-use crate::types::{
-    AgentStatus, Direction, SignalLevel, SignalSnapshot,
-};
+use crate::types::{AgentStatus, Direction, SignalLevel, SignalSnapshot};
 
 const DAILY_STATE_PATH: &str = "data/daily_state.json";
 
@@ -39,7 +37,7 @@ pub struct PositionInfo {
     pub coin: String,
     pub direction: Direction,
     pub entry_price: f64,
-    pub notional: f64,     // |size| * entry_price
+    pub notional: f64, // |size| * entry_price
     pub leverage: u8,
     pub unrealized_pnl: f64, // from HL directly
 }
@@ -66,7 +64,6 @@ pub struct App {
     pub trade_log: Vec<String>,
     #[allow(dead_code)]
     pub initial_equity: f64,
-    #[allow(dead_code)]
     pub config_initial_usd: f64,
     pub fee_round_trip_pct: f64,
     pub equity: f64,
@@ -144,9 +141,10 @@ impl App {
     pub fn update_balances(&mut self, balances: ExchangeBalances) {
         self.balances = balances;
         self.equity = self.balances.hl_equity;
-        // Total PnL % since bot start: use actual initial_equity (real balance at startup), not config
-        if self.initial_equity > 0.0 {
-            self.total_pnl_pct = ((self.equity - self.initial_equity) / self.initial_equity) * 100.0;
+        // Total PnL % relative to original capital (config.capital.initial_usd)
+        if self.config_initial_usd > 0.0 {
+            self.total_pnl_pct =
+                ((self.equity - self.config_initial_usd) / self.config_initial_usd) * 100.0;
         }
         // Daily PnL (reset at UTC midnight, persisted to disk)
         let today = Utc::now().ordinal();
@@ -156,7 +154,8 @@ impl App {
             save_daily_state(self.equity);
         }
         if self.start_of_day_equity > 0.0 {
-            self.daily_pnl_pct = ((self.equity - self.start_of_day_equity) / self.start_of_day_equity) * 100.0;
+            self.daily_pnl_pct =
+                ((self.equity - self.start_of_day_equity) / self.start_of_day_equity) * 100.0;
         }
     }
 
@@ -165,9 +164,9 @@ impl App {
         let chunks = Layout::default()
             .direction(ratatui::layout::Direction::Vertical)
             .constraints([
-                Constraint::Length(9),         // top: status + signal
+                Constraint::Length(9),          // top: status + signal
                 Constraint::Length(pos_height), // positions: grows with count
-                Constraint::Min(6),            // log
+                Constraint::Min(6),             // log
                 Constraint::Length(3),          // footer: stats + keys
             ])
             .split(frame.area());
@@ -185,24 +184,47 @@ impl App {
             .split(area);
 
         // Left: portfolio info
-        let total_pnl_color = if self.total_pnl_pct >= 0.0 { Color::Green } else { Color::Red };
-        let daily_pnl_color = if self.daily_pnl_pct >= 0.0 { Color::Green } else { Color::Red };
+        let total_pnl_color = if self.total_pnl_pct >= 0.0 {
+            Color::Green
+        } else {
+            Color::Red
+        };
+        let daily_pnl_color = if self.daily_pnl_pct >= 0.0 {
+            Color::Green
+        } else {
+            Color::Red
+        };
 
         let status_lines = vec![
             Line::from(vec![
-                Span::styled(" BTC:", Style::default().fg(Color::Cyan)),
-                Span::styled(format!("${:.0}", self.btc_price), Style::default().fg(Color::White).bold()),
-                Span::styled(format!("  [{}]", self.status), Style::default().fg(status_color(self.status))),
+                Span::styled(" BTC: ", Style::default().fg(Color::Cyan)),
+                Span::styled(
+                    format!("${:.0}", self.btc_price),
+                    Style::default().fg(Color::White).bold(),
+                ),
+                Span::styled(
+                    format!("  [{}]", self.status),
+                    Style::default().fg(status_color(self.status)),
+                ),
             ]),
             Line::from(vec![
                 Span::styled(" HL:   ", Style::default().fg(Color::Cyan)),
-                Span::styled(format!("${:.2}", self.balances.hl_equity), Style::default().fg(Color::White)),
+                Span::styled(
+                    format!("${:.2}", self.balances.hl_equity),
+                    Style::default().fg(Color::White),
+                ),
                 Span::styled("  Free: ", Style::default().fg(Color::Cyan)),
-                Span::styled(format!("${:.2}", self.balances.hl_available), Style::default().fg(Color::White)),
+                Span::styled(
+                    format!("${:.2}", self.balances.hl_available),
+                    Style::default().fg(Color::White),
+                ),
             ]),
             Line::from(vec![
                 Span::styled(" Total:", Style::default().fg(Color::Cyan)),
-                Span::styled(format!(" ${:.2}", self.equity), Style::default().fg(Color::White).bold()),
+                Span::styled(
+                    format!(" ${:.2}", self.equity),
+                    Style::default().fg(Color::White).bold(),
+                ),
             ]),
             Line::from(vec![
                 Span::styled(" PnL:  ", Style::default().fg(Color::Cyan)),
@@ -210,6 +232,8 @@ impl App {
                     format!(" {:+.2}%", self.total_pnl_pct),
                     Style::default().fg(total_pnl_color),
                 ),
+            ]),
+            Line::from(vec![
                 Span::styled("  Today:", Style::default().fg(Color::Cyan)),
                 Span::styled(
                     format!(" {:+.2}%", self.daily_pnl_pct),
@@ -225,8 +249,12 @@ impl App {
             ]),
         ];
 
-        let status_block = Paragraph::new(status_lines)
-            .block(Block::default().borders(Borders::ALL).title(" openSigma v1 ").border_style(Style::default().fg(Color::Cyan)));
+        let status_block = Paragraph::new(status_lines).block(
+            Block::default()
+                .borders(Borders::ALL)
+                .title(" openSigma v1 ")
+                .border_style(Style::default().fg(Color::Cyan)),
+        );
         frame.render_widget(status_block, top_chunks[0]);
 
         // Right: signal info with all indicators
@@ -237,13 +265,23 @@ impl App {
 
             vec![
                 Line::from(vec![
-                    Span::styled(format!(" {}", sig.level), Style::default().fg(level_color).bold()),
+                    Span::styled(
+                        format!(" {}", sig.level),
+                        Style::default().fg(level_color).bold(),
+                    ),
                     Span::raw(format!(" (net={:+})  ", sig.net_score)),
-                    Span::styled(format!("bull={} bear={}", sig.bull_score, sig.bear_score), Style::default().fg(Color::DarkGray)),
+                    Span::styled(
+                        format!("bull={} bear={}", sig.bull_score, sig.bear_score),
+                        Style::default().fg(Color::DarkGray),
+                    ),
                 ]),
                 Line::from(vec![
                     Span::styled(" EMA:", Style::default().fg(Color::Cyan)),
-                    Span::raw(format!(" 9={:.0} 21={:.0}", ind.ema_9.unwrap_or(0.0), ind.ema_21.unwrap_or(0.0))),
+                    Span::raw(format!(
+                        " 9={:.0} 21={:.0}",
+                        ind.ema_9.unwrap_or(0.0),
+                        ind.ema_21.unwrap_or(0.0)
+                    )),
                     Span::styled("  RSI:", Style::default().fg(Color::Cyan)),
                     Span::raw(format!(" {:.1}", ind.rsi_14.unwrap_or(0.0))),
                     Span::styled("  StochRSI:", Style::default().fg(Color::Cyan)),
@@ -258,8 +296,12 @@ impl App {
                     Span::raw(format!(" {:.3}", ind.atr_pct.unwrap_or(0.0))),
                     Span::styled("  BB:", Style::default().fg(Color::Cyan)),
                     Span::styled(
-                        format!(" {}", bb_label(ind.bb_squeeze, ind.bb_position.unwrap_or(0.0))),
-                        Style::default().fg(bb_color(ind.bb_squeeze, ind.bb_position.unwrap_or(0.0))),
+                        format!(
+                            " {}",
+                            bb_label(ind.bb_squeeze, ind.bb_position.unwrap_or(0.0))
+                        ),
+                        Style::default()
+                            .fg(bb_color(ind.bb_squeeze, ind.bb_position.unwrap_or(0.0))),
                     ),
                 ]),
                 Line::from(vec![
@@ -268,7 +310,10 @@ impl App {
                     Span::styled("  CVDΔ:", Style::default().fg(Color::Cyan)),
                     Span::raw(format!(" {}", format_cvd_delta(ind.cvd_slope))),
                     Span::styled("  Regime:", Style::default().fg(Color::Cyan)),
-                    Span::styled(format!(" {}", regime_label(ind)), Style::default().fg(regime_color(ind))),
+                    Span::styled(
+                        format!(" {}", regime_label(ind)),
+                        Style::default().fg(regime_color(ind)),
+                    ),
                     Span::styled("  EMAΔ%:", Style::default().fg(Color::Cyan)),
                     Span::raw(format!(
                         " {}",
@@ -324,41 +369,79 @@ impl App {
                 ]),
                 Line::from(vec![
                     Span::styled(" Filter: ", Style::default().fg(Color::DarkGray)),
-                    Span::styled(filter, Style::default().fg(if filter == "none" { Color::DarkGray } else { Color::Yellow })),
+                    Span::styled(
+                        filter,
+                        Style::default().fg(if filter == "none" {
+                            Color::DarkGray
+                        } else {
+                            Color::Yellow
+                        }),
+                    ),
                 ]),
             ]
         } else {
-            vec![Line::from(Span::styled(" Waiting for data...", Style::default().fg(Color::DarkGray)))]
+            vec![Line::from(Span::styled(
+                " Waiting for data...",
+                Style::default().fg(Color::DarkGray),
+            ))]
         };
 
-        let signal_block = Paragraph::new(signal_lines)
-            .block(Block::default().borders(Borders::ALL).title(" Signal ").border_style(Style::default().fg(Color::Cyan)));
+        let signal_block = Paragraph::new(signal_lines).block(
+            Block::default()
+                .borders(Borders::ALL)
+                .title(" Signal ")
+                .border_style(Style::default().fg(Color::Cyan)),
+        );
         frame.render_widget(signal_block, top_chunks[1]);
     }
 
     fn render_positions(&self, frame: &mut Frame, area: Rect) {
         let title = format!(" Positions [{}] ", self.positions.len());
         let items: Vec<ListItem> = if self.positions.is_empty() {
-            vec![ListItem::new(Span::styled("  No active positions", Style::default().fg(Color::DarkGray)))]
+            vec![ListItem::new(Span::styled(
+                "  No active positions",
+                Style::default().fg(Color::DarkGray),
+            ))]
         } else {
-            self.positions.iter().map(|p| {
-                let pnl_color = if p.unrealized_pnl >= 0.0 { Color::Green } else { Color::Red };
-                let dir_color = if p.direction == Direction::Long { Color::Green } else { Color::Red };
+            self.positions
+                .iter()
+                .map(|p| {
+                    let pnl_color = if p.unrealized_pnl >= 0.0 {
+                        Color::Green
+                    } else {
+                        Color::Red
+                    };
+                    let dir_color = if p.direction == Direction::Long {
+                        Color::Green
+                    } else {
+                        Color::Red
+                    };
 
-                ListItem::new(Line::from(vec![
-                    Span::styled(format!(" {} ", p.direction), Style::default().fg(dir_color).bold()),
-                    Span::raw(format!("{} ${:.0} @{:.0} lev={}  ", p.coin, p.notional, p.entry_price, p.leverage)),
-                    Span::styled("PnL: ", Style::default().fg(Color::Cyan)),
-                    Span::styled(
-                        format!("${:+.2}", p.unrealized_pnl),
-                        Style::default().fg(pnl_color).bold(),
-                    ),
-                ]))
-            }).collect()
+                    ListItem::new(Line::from(vec![
+                        Span::styled(
+                            format!(" {} ", p.direction),
+                            Style::default().fg(dir_color).bold(),
+                        ),
+                        Span::raw(format!(
+                            "{} ${:.0} @{:.0} lev={}  ",
+                            p.coin, p.notional, p.entry_price, p.leverage
+                        )),
+                        Span::styled("PnL: ", Style::default().fg(Color::Cyan)),
+                        Span::styled(
+                            format!("${:+.2}", p.unrealized_pnl),
+                            Style::default().fg(pnl_color).bold(),
+                        ),
+                    ]))
+                })
+                .collect()
         };
 
-        let positions_block = List::new(items)
-            .block(Block::default().borders(Borders::ALL).title(title).border_style(Style::default().fg(Color::Cyan)));
+        let positions_block = List::new(items).block(
+            Block::default()
+                .borders(Borders::ALL)
+                .title(title)
+                .border_style(Style::default().fg(Color::Cyan)),
+        );
         frame.render_widget(positions_block, area);
     }
 
@@ -407,7 +490,11 @@ impl App {
             Color::DarkGray
         };
 
-        let pnl_color = if self.stats.total_pnl >= 0.0 { Color::Green } else { Color::Red };
+        let pnl_color = if self.stats.total_pnl >= 0.0 {
+            Color::Green
+        } else {
+            Color::Red
+        };
 
         let footer_line = Line::from(vec![
             Span::styled(" Trades: ", Style::default().fg(Color::Cyan)),
@@ -415,14 +502,23 @@ impl App {
             Span::styled("  Win: ", Style::default().fg(Color::Cyan)),
             Span::raw(format!("{:.1}%", self.stats.win_rate * 100.0)),
             Span::styled("  PnL: ", Style::default().fg(Color::Cyan)),
-            Span::styled(format!("${:+.2}", self.stats.total_pnl), Style::default().fg(pnl_color)),
+            Span::styled(
+                format!("${:+.2}", self.stats.total_pnl),
+                Style::default().fg(pnl_color),
+            ),
             Span::styled("  Streak: ", Style::default().fg(Color::Cyan)),
             Span::styled(streak_str, Style::default().fg(streak_color)),
-            Span::styled("    [q] quit  [k] kill switch", Style::default().fg(Color::DarkGray)),
+            Span::styled(
+                "    [q] quit  [k] kill switch",
+                Style::default().fg(Color::DarkGray),
+            ),
         ]);
 
-        let footer = Paragraph::new(footer_line)
-            .block(Block::default().borders(Borders::ALL).border_style(Style::default().fg(Color::Cyan)));
+        let footer = Paragraph::new(footer_line).block(
+            Block::default()
+                .borders(Borders::ALL)
+                .border_style(Style::default().fg(Color::Cyan)),
+        );
         frame.render_widget(footer, area);
     }
 }
@@ -453,9 +549,13 @@ fn signal_level_color(level: SignalLevel) -> Color {
 
 fn bb_label(squeeze: bool, pos: f64) -> String {
     if squeeze {
-        if pos <= -0.7 { "SQ↓".into() }
-        else if pos >= 0.7 { "SQ↑".into() }
-        else { "SQ".into() }
+        if pos <= -0.7 {
+            "SQ↓".into()
+        } else if pos >= 0.7 {
+            "SQ↑".into()
+        } else {
+            "SQ".into()
+        }
     } else if pos > 1.0 {
         "BRK↑".into()
     } else if pos < -1.0 {
@@ -467,9 +567,13 @@ fn bb_label(squeeze: bool, pos: f64) -> String {
 
 fn bb_color(squeeze: bool, pos: f64) -> Color {
     if squeeze {
-        if pos <= -0.7 { Color::Green }
-        else if pos >= 0.7 { Color::Red }
-        else { Color::Yellow }
+        if pos <= -0.7 {
+            Color::Green
+        } else if pos >= 0.7 {
+            Color::Red
+        } else {
+            Color::Yellow
+        }
     } else if pos.abs() > 1.0 {
         Color::Magenta
     } else {
@@ -511,7 +615,10 @@ fn regime_label(ind: &crate::types::IndicatorValues) -> String {
         _ => "n/a",
     };
     if ind.bb_squeeze {
-        format!("{base} {}", bb_label(ind.bb_squeeze, ind.bb_position.unwrap_or(0.0)))
+        format!(
+            "{base} {}",
+            bb_label(ind.bb_squeeze, ind.bb_position.unwrap_or(0.0))
+        )
     } else {
         base.to_string()
     }

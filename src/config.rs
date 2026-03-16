@@ -102,6 +102,9 @@ pub struct ExecutionConfig {
     /// Extra offset (%) applied to TP when posting maker exit.
     #[serde(default = "default_maker_exit_markup_pct")]
     pub maker_exit_markup_pct: f64,
+    /// Minimum notional USD per order (Hyperliquid requires $10).
+    #[serde(default = "default_min_order_notional_usd")]
+    pub min_order_notional_usd: f64,
     /// If ATR% is above this, use taker-style TP (trigger) instead of maker.
     #[serde(default = "default_maker_exit_max_atr_pct")]
     pub maker_exit_max_atr_pct: f64,
@@ -210,6 +213,7 @@ fn default_fee_bps_per_side() -> f64 { 3.5 }
 fn default_sell_trigger_extra_buffer_pct() -> f64 { 0.02 }
 fn default_maker_exit_timeout_secs() -> u64 { 35 }
 fn default_maker_exit_markup_pct() -> f64 { 0.01 }
+fn default_min_order_notional_usd() -> f64 { 10.5 }
 fn default_maker_exit_max_atr_pct() -> f64 { 0.23 }
 fn default_maker_exit_trend_atr_pct() -> f64 { 0.16 }
 
@@ -261,9 +265,15 @@ impl Config {
         let now = chrono::Utc::now().time();
         for session in self.sessions.values() {
             let start = chrono::NaiveTime::parse_from_str(&session.start, "%H:%M")
-                .unwrap_or(chrono::NaiveTime::from_hms_opt(0, 0, 0).unwrap());
+                .unwrap_or_else(|_| {
+                    warn!("Invalid session start time '{}', defaulting to 00:00", session.start);
+                    chrono::NaiveTime::from_hms_opt(0, 0, 0).unwrap()
+                });
             let end = chrono::NaiveTime::parse_from_str(&session.end, "%H:%M")
-                .unwrap_or(chrono::NaiveTime::from_hms_opt(0, 0, 0).unwrap());
+                .unwrap_or_else(|_| {
+                    warn!("Invalid session end time '{}', defaulting to 00:00", session.end);
+                    chrono::NaiveTime::from_hms_opt(0, 0, 0).unwrap()
+                });
             let in_session = if start <= end {
                 now >= start && now < end
             } else {

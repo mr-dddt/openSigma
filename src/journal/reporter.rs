@@ -618,6 +618,46 @@ pub fn apply_param_adjustments(config: &mut crate::config::Config, adjustments: 
                 config.signals.vwap_weight = n.max(0) as i32;
                 true
             })
+        } else if name == "funding_weight" {
+            adj.value.as_i64().map(|n| {
+                config.signals.funding_weight = n.max(0) as i32;
+                true
+            })
+        } else if name == "delta_div_weight" {
+            adj.value.as_i64().map(|n| {
+                config.signals.delta_div_weight = n.max(0) as i32;
+                true
+            })
+        } else if name == "oi_weight" {
+            adj.value.as_i64().map(|n| {
+                config.signals.oi_weight = n.max(0) as i32;
+                true
+            })
+        } else if name == "ob_lean_threshold" {
+            adj.value.as_f64().map(|v| {
+                config.signals.ob_lean_threshold = v.max(0.5);
+                true
+            })
+        } else if name == "ob_strong_threshold" {
+            adj.value.as_f64().map(|v| {
+                config.signals.ob_strong_threshold = v.max(1.0);
+                true
+            })
+        } else if name == "regime_trend_spread_pct" {
+            adj.value.as_f64().map(|v| {
+                config.signals.regime_trend_spread_pct = v.max(0.01);
+                true
+            })
+        } else if name == "oi_delta_min_pct" {
+            adj.value.as_f64().map(|v| {
+                config.signals.oi_delta_min_pct = v.max(0.01);
+                true
+            })
+        } else if name == "cvd_slope_threshold" {
+            adj.value.as_f64().map(|v| {
+                config.signals.cvd_slope_threshold = v.max(1.0);
+                true
+            })
         } else {
             None
         };

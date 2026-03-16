@@ -86,7 +86,10 @@ async fn main() -> Result<()> {
     // Log to file to avoid interfering with TUI rendering
     std::fs::create_dir_all("data").ok();
     std::fs::create_dir_all("data/reports").ok();
-    let log_file = std::fs::File::create("data/opensigma.log")?;
+    let log_file = std::fs::File::options()
+        .append(true)
+        .create(true)
+        .open("data/opensigma.log")?;
     tracing_subscriber::fmt()
         .with_env_filter(
             tracing_subscriber::EnvFilter::try_from_default_env()
@@ -478,6 +481,11 @@ async fn main() -> Result<()> {
                                                 tokio::spawn(async move { tg_ref.send_trade_close(&r).await });
                                             }
 
+                                            info!(
+                                                symbol = %trade.symbol, direction = %trade.direction,
+                                                exit_reason = %reason, gross_pnl, fee_usd, net_pnl = pnl,
+                                                "Trade closed"
+                                            );
                                             let _ = tui_tx_clone.send(TuiUpdate::Log(format!(
                                                 "[{}] {} {} closed ({}) PnL: ${:.2} (gross ${:.2}, fee ${:.2})",
                                                 chrono::Utc::now().format("%H:%M:%S"),
@@ -637,6 +645,11 @@ async fn main() -> Result<()> {
                                 tokio::spawn(async move { tg_ref.send_trade_close(&r).await });
                             }
 
+                            info!(
+                                symbol = %trade.symbol, direction = %trade.direction,
+                                exit_reason = "expired", gross_pnl, fee_usd, net_pnl = pnl,
+                                "Trade closed"
+                            );
                             let _ = tui_tx_clone.send(TuiUpdate::Log(format!(
                                 "[{}] {} position expired — force closed, PnL: ${:.2} (gross ${:.2}, fee ${:.2})",
                                 chrono::Utc::now().format("%H:%M:%S"),
@@ -745,6 +758,11 @@ async fn main() -> Result<()> {
                                 let tg_ref = tg.clone();
                                 tokio::spawn(async move { tg_ref.send_trade_close(&r).await });
                             }
+                            info!(
+                                symbol = %trade.symbol, direction = %trade.direction,
+                                exit_reason = %reason, gross_pnl, fee_usd, net_pnl = pnl,
+                                "Trade closed"
+                            );
                             let _ = tui_tx_clone.send(TuiUpdate::Log(format!(
                                 "[{}] Proactive exit ({}) {} {} PnL: ${:.2} (gross ${:.2}, fee ${:.2}) [elapsed={}s net={:+.3}% peak={:+.3}%]",
                                 chrono::Utc::now().format("%H:%M:%S"),
@@ -864,6 +882,11 @@ async fn main() -> Result<()> {
                                     let tg_ref = tg.clone();
                                     tokio::spawn(async move { tg_ref.send_trade_close(&r).await });
                                 }
+                                info!(
+                                    symbol = %trade.symbol, direction = %trade.direction,
+                                    exit_reason = "maker_timeout", gross_pnl, fee_usd, net_pnl = pnl,
+                                    "Trade closed"
+                                );
                                 let _ = tui_tx_clone.send(TuiUpdate::Log(format!(
                                     "[{}] Maker timeout fallback close {} {} PnL: ${:.2} (gross ${:.2}, fee ${:.2})",
                                     chrono::Utc::now().format("%H:%M:%S"),
@@ -1370,6 +1393,11 @@ async fn handle_llm_decision(
                             entry_delta_divergence: opp_trade.entry_delta_divergence.clone(),
                         };
                         let _ = journal.log_entry(&record);
+                        info!(
+                            symbol = %opp_trade.symbol, direction = %opp_trade.direction,
+                            exit_reason = "reversed", gross_pnl, fee_usd, net_pnl = pnl,
+                            "Trade closed"
+                        );
                         if let Some(ref tg) = telegram {
                             let r = record.clone();
                             let tg_ref = tg.clone();
@@ -1424,8 +1452,16 @@ async fn handle_llm_decision(
                 let is_buy = *direction == Direction::Long;
                 // size_usd is margin; notional = margin × leverage
                 // HL requires minimum $10 notional per order
-                let notional = (size_usd * leverage as f64).max(10.5);
-                let price = if latest_price > 0.0 { latest_price } else { snapshot.indicators.ema_9.unwrap_or(80000.0) };
+                let notional = (size_usd * leverage as f64).max(config.execution.min_order_notional_usd);
+                let price = if latest_price > 0.0 {
+                    latest_price
+                } else if let Some(ema) = snapshot.indicators.ema_9 {
+                    warn!("latest_price is 0, using EMA9 as fallback: {}", ema);
+                    ema
+                } else {
+                    warn!("No valid price available — skipping order placement");
+                    return;
+                };
                 let sz_coin = notional / price;
                 match hl.market_order("BTC", is_buy, sz_coin, leverage).await {
                     Ok(result) => {
@@ -1461,6 +1497,7 @@ async fn handle_llm_decision(
                                             .as_deref()
                                             .and_then(|s| s.parse::<u64>().ok());
                                         if maker_exit_oid.is_none() {
+                                            warn!("Maker TP succeeded but no parseable OID — falling back to trigger TP");
                                             let _ = hl.take_profit("BTC", tp_price, sz_coin, !is_buy).await;
                                         }
                                     }
