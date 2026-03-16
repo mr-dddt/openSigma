@@ -75,6 +75,12 @@ enum TuiUpdate {
     Balances(ExchangeBalances),
 }
 
+#[derive(Debug, Clone)]
+struct MakerExitState {
+    oid: u64,
+    placed_at: chrono::DateTime<chrono::Utc>,
+}
+
 #[tokio::main]
 async fn main() -> Result<()> {
     // Log to file to avoid interfering with TUI rendering
@@ -362,6 +368,7 @@ async fn main() -> Result<()> {
         let mut latest_price: f64 = 0.0;
         let mut close_retry_after: HashMap<Uuid, chrono::DateTime<chrono::Utc>> = HashMap::new();
         let mut peak_pnl_pct: HashMap<Uuid, f64> = HashMap::new();
+        let mut maker_exit_orders: HashMap<Uuid, MakerExitState> = HashMap::new();
 
         loop {
             tokio::select! {
@@ -379,6 +386,12 @@ async fn main() -> Result<()> {
                             for pe in events {
                                 match pe {
                                     PositionEvent::StopHit(id) | PositionEvent::TakeProfitHit(id) => {
+                                        // When a maker TP is resting, let exchange fill it passively.
+                                        if matches!(&pe, PositionEvent::TakeProfitHit(_))
+                                            && maker_exit_orders.contains_key(&id)
+                                        {
+                                            continue;
+                                        }
                                         let reason = match pe {
                                             PositionEvent::StopHit(_) => "stop_loss",
                                             PositionEvent::TakeProfitHit(_) => "take_profit",
@@ -391,32 +404,39 @@ async fn main() -> Result<()> {
                                         {
                                             continue;
                                         }
+                                        let mut close_fill_price: Option<f64> = None;
                                         if let Some(trade_snapshot) = position_monitor.get_trade(&id) {
-                                            if let Err(e) = close_trade_on_exchange(&trade_snapshot, &hl_executor).await {
-                                                close_retry_after.insert(
-                                                    id,
-                                                    now + chrono::Duration::seconds(CLOSE_RETRY_BACKOFF_SECS),
-                                                );
-                                                let _ = tui_tx_clone.send(TuiUpdate::Log(format!(
-                                                    "[{}] Close failed ({}) {} {}: {} — retry in {}s",
-                                                    chrono::Utc::now().format("%H:%M:%S"),
-                                                    reason,
-                                                    trade_snapshot.symbol,
-                                                    trade_snapshot.direction,
-                                                    e,
-                                                    CLOSE_RETRY_BACKOFF_SECS,
-                                                ))).await;
-                                                continue;
+                                            match close_trade_on_exchange(&trade_snapshot, &hl_executor).await {
+                                                Ok(px) => close_fill_price = px,
+                                                Err(e) => {
+                                                    close_retry_after.insert(
+                                                        id,
+                                                        now + chrono::Duration::seconds(CLOSE_RETRY_BACKOFF_SECS),
+                                                    );
+                                                    let _ = tui_tx_clone.send(TuiUpdate::Log(format!(
+                                                        "[{}] Close failed ({}) {} {}: {} — retry in {}s",
+                                                        chrono::Utc::now().format("%H:%M:%S"),
+                                                        reason,
+                                                        trade_snapshot.symbol,
+                                                        trade_snapshot.direction,
+                                                        e,
+                                                        CLOSE_RETRY_BACKOFF_SECS,
+                                                    ))).await;
+                                                    continue;
+                                                }
                                             }
                                         }
                                         if let Some(trade) = position_monitor.remove_trade(&id) {
+                                            clear_maker_exit_order(&id, &mut maker_exit_orders, &hl_executor).await;
                                             close_retry_after.remove(&id);
                                             peak_pnl_pct.remove(&id);
-                                            let exit_price = latest_price;
-                                            let pnl = match trade.direction {
-                                                Direction::Long => (exit_price - trade.entry_price) / trade.entry_price * trade.size_usd,
-                                                Direction::Short => (trade.entry_price - exit_price) / trade.entry_price * trade.size_usd,
+                                            let exit_price = close_fill_price.unwrap_or(latest_price);
+                                            let fee_bps = {
+                                                let c = config_for_engine.read().await;
+                                                c.execution.fee_bps_per_side.max(0.0)
                                             };
+                                            let (gross_pnl, fee_usd, pnl) =
+                                                compute_trade_pnl_with_fees(&trade, exit_price, fee_bps);
                                             risk.record_trade_pnl(pnl);
                                             let pnl_pct = if initial_usd > 0.0 { (risk.current_equity() - initial_usd) / initial_usd * 100.0 } else { 0.0 };
                                             aggregator.update_daily_pnl(pnl_pct);
@@ -459,9 +479,9 @@ async fn main() -> Result<()> {
                                             }
 
                                             let _ = tui_tx_clone.send(TuiUpdate::Log(format!(
-                                                "[{}] {} {} closed ({}) PnL: ${:.2}",
+                                                "[{}] {} {} closed ({}) PnL: ${:.2} (gross ${:.2}, fee ${:.2})",
                                                 chrono::Utc::now().format("%H:%M:%S"),
-                                                trade.symbol, trade.direction, reason, pnl,
+                                                trade.symbol, trade.direction, reason, pnl, gross_pnl, fee_usd,
                                             ))).await;
 
                                             let _ = tui_tx_clone.send(TuiUpdate::Stats(PerformanceStats {
@@ -543,32 +563,38 @@ async fn main() -> Result<()> {
                         {
                             continue;
                         }
+                        let mut close_fill_price: Option<f64> = None;
                         if let Some(trade_snapshot) = position_monitor.get_trade(&id) {
-                            if let Err(e) = close_trade_on_exchange(&trade_snapshot, &hl_executor).await {
-                                close_retry_after.insert(
-                                    id,
-                                    now + chrono::Duration::seconds(CLOSE_RETRY_BACKOFF_SECS),
-                                );
-                                let _ = tui_tx_clone.send(TuiUpdate::Log(format!(
-                                    "[{}] Expire close failed {} {}: {} — retry in {}s",
-                                    chrono::Utc::now().format("%H:%M:%S"),
-                                    trade_snapshot.symbol,
-                                    trade_snapshot.direction,
-                                    e,
-                                    CLOSE_RETRY_BACKOFF_SECS,
-                                ))).await;
-                                continue;
+                            match close_trade_on_exchange(&trade_snapshot, &hl_executor).await {
+                                Ok(px) => close_fill_price = px,
+                                Err(e) => {
+                                    close_retry_after.insert(
+                                        id,
+                                        now + chrono::Duration::seconds(CLOSE_RETRY_BACKOFF_SECS),
+                                    );
+                                    let _ = tui_tx_clone.send(TuiUpdate::Log(format!(
+                                        "[{}] Expire close failed {} {}: {} — retry in {}s",
+                                        chrono::Utc::now().format("%H:%M:%S"),
+                                        trade_snapshot.symbol,
+                                        trade_snapshot.direction,
+                                        e,
+                                        CLOSE_RETRY_BACKOFF_SECS,
+                                    ))).await;
+                                    continue;
+                                }
                             }
                         }
                         if let Some(trade) = position_monitor.remove_trade(&id) {
+                            clear_maker_exit_order(&id, &mut maker_exit_orders, &hl_executor).await;
                             close_retry_after.remove(&id);
                             peak_pnl_pct.remove(&id);
                             info!(id = %trade.id, symbol = %trade.symbol, "Position expired (max hold time)");
-                            let current_price = latest_price;
-                            let pnl = match trade.direction {
-                                Direction::Long => (current_price - trade.entry_price) / trade.entry_price * trade.size_usd,
-                                Direction::Short => (trade.entry_price - current_price) / trade.entry_price * trade.size_usd,
-                            };
+                            let current_price = close_fill_price.unwrap_or(latest_price);
+                            let (gross_pnl, fee_usd, pnl) = compute_trade_pnl_with_fees(
+                                &trade,
+                                current_price,
+                                cfg.execution.fee_bps_per_side.max(0.0),
+                            );
                             risk.record_trade_pnl(pnl);
                             tuner.record_trade();
                             {
@@ -612,9 +638,9 @@ async fn main() -> Result<()> {
                             }
 
                             let _ = tui_tx_clone.send(TuiUpdate::Log(format!(
-                                "[{}] {} position expired — force closed, PnL: ${:.2}",
+                                "[{}] {} position expired — force closed, PnL: ${:.2} (gross ${:.2}, fee ${:.2})",
                                 chrono::Utc::now().format("%H:%M:%S"),
-                                trade.symbol, pnl,
+                                trade.symbol, pnl, gross_pnl, fee_usd,
                             ))).await;
                             any_expired_closed = true;
                         }
@@ -631,7 +657,9 @@ async fn main() -> Result<()> {
                         &cfg.execution,
                         &mut peak_pnl_pct,
                     );
-                    for (id, reason) in proactive_exits {
+                    for px in proactive_exits {
+                        let id = px.id;
+                        let reason = px.reason.clone();
                         let now = chrono::Utc::now();
                         if close_retry_after
                             .get(&id)
@@ -639,32 +667,41 @@ async fn main() -> Result<()> {
                         {
                             continue;
                         }
+                        let mut close_fill_price: Option<f64> = None;
                         if let Some(trade_snapshot) = position_monitor.get_trade(&id) {
-                            if let Err(e) = close_trade_on_exchange(&trade_snapshot, &hl_executor).await {
-                                close_retry_after.insert(
-                                    id,
-                                    now + chrono::Duration::seconds(CLOSE_RETRY_BACKOFF_SECS),
-                                );
-                                let _ = tui_tx_clone.send(TuiUpdate::Log(format!(
-                                    "[{}] Proactive close failed ({}) {} {}: {} — retry in {}s",
-                                    chrono::Utc::now().format("%H:%M:%S"),
-                                    reason,
-                                    trade_snapshot.symbol,
-                                    trade_snapshot.direction,
-                                    e,
-                                    CLOSE_RETRY_BACKOFF_SECS,
-                                ))).await;
-                                continue;
+                            match close_trade_on_exchange(&trade_snapshot, &hl_executor).await {
+                                Ok(px) => close_fill_price = px,
+                                Err(e) => {
+                                    close_retry_after.insert(
+                                        id,
+                                        now + chrono::Duration::seconds(CLOSE_RETRY_BACKOFF_SECS),
+                                    );
+                                    let _ = tui_tx_clone.send(TuiUpdate::Log(format!(
+                                        "[{}] Proactive close failed ({}) {} {}: {} — retry in {}s [elapsed={}s net={:+.3}% peak={:+.3}%]",
+                                        chrono::Utc::now().format("%H:%M:%S"),
+                                        reason,
+                                        trade_snapshot.symbol,
+                                        trade_snapshot.direction,
+                                        e,
+                                        CLOSE_RETRY_BACKOFF_SECS,
+                                        px.elapsed_secs,
+                                        px.net_pnl_pct,
+                                        px.peak_pnl_pct,
+                                    ))).await;
+                                    continue;
+                                }
                             }
                         }
                         if let Some(trade) = position_monitor.remove_trade(&id) {
+                            clear_maker_exit_order(&id, &mut maker_exit_orders, &hl_executor).await;
                             close_retry_after.remove(&id);
                             peak_pnl_pct.remove(&id);
-                            let current_price = latest_price;
-                            let pnl = match trade.direction {
-                                Direction::Long => (current_price - trade.entry_price) / trade.entry_price * trade.size_usd,
-                                Direction::Short => (trade.entry_price - current_price) / trade.entry_price * trade.size_usd,
-                            };
+                            let current_price = close_fill_price.unwrap_or(latest_price);
+                            let (gross_pnl, fee_usd, pnl) = compute_trade_pnl_with_fees(
+                                &trade,
+                                current_price,
+                                cfg.execution.fee_bps_per_side.max(0.0),
+                            );
                             risk.record_trade_pnl(pnl);
                             tuner.record_trade();
                             let pnl_pct = if initial_usd > 0.0 {
@@ -709,13 +746,134 @@ async fn main() -> Result<()> {
                                 tokio::spawn(async move { tg_ref.send_trade_close(&r).await });
                             }
                             let _ = tui_tx_clone.send(TuiUpdate::Log(format!(
-                                "[{}] Proactive exit ({}) {} {} PnL: ${:.2}",
+                                "[{}] Proactive exit ({}) {} {} PnL: ${:.2} (gross ${:.2}, fee ${:.2}) [elapsed={}s net={:+.3}% peak={:+.3}%]",
                                 chrono::Utc::now().format("%H:%M:%S"),
                                 reason,
                                 trade.symbol,
                                 trade.direction,
                                 pnl,
+                                gross_pnl,
+                                fee_usd,
+                                px.elapsed_secs,
+                                px.net_pnl_pct,
+                                px.peak_pnl_pct,
                             ))).await;
+                        }
+                    }
+
+                    // Maker exit watchdog: if passive TP does not fill in time, fall back to taker close.
+                    if cfg.execution.enable_maker_exit {
+                        let now = chrono::Utc::now();
+                        let mut stale_maker_ids = Vec::new();
+                        let mut maker_timeout_ids = Vec::new();
+                        for (id, state) in &maker_exit_orders {
+                            if position_monitor.get_trade(id).is_none() {
+                                stale_maker_ids.push(*id);
+                                continue;
+                            }
+                            let age_secs = (now - state.placed_at).num_seconds();
+                            if age_secs >= cfg.execution.maker_exit_timeout_secs as i64 {
+                                maker_timeout_ids.push(*id);
+                            }
+                        }
+
+                        for id in stale_maker_ids {
+                            clear_maker_exit_order(&id, &mut maker_exit_orders, &hl_executor).await;
+                        }
+
+                        for id in maker_timeout_ids {
+                            let now = chrono::Utc::now();
+                            if close_retry_after
+                                .get(&id)
+                                .is_some_and(|next_try| now < *next_try)
+                            {
+                                continue;
+                            }
+                            let mut close_fill_price: Option<f64> = None;
+                            if let Some(trade_snapshot) = position_monitor.get_trade(&id) {
+                                clear_maker_exit_order(&id, &mut maker_exit_orders, &hl_executor).await;
+                                match close_trade_on_exchange(&trade_snapshot, &hl_executor).await {
+                                    Ok(px) => close_fill_price = px,
+                                    Err(e) => {
+                                        close_retry_after.insert(
+                                            id,
+                                            now + chrono::Duration::seconds(CLOSE_RETRY_BACKOFF_SECS),
+                                        );
+                                        let _ = tui_tx_clone.send(TuiUpdate::Log(format!(
+                                            "[{}] Maker timeout fallback failed {} {}: {} — retry in {}s",
+                                            chrono::Utc::now().format("%H:%M:%S"),
+                                            trade_snapshot.symbol,
+                                            trade_snapshot.direction,
+                                            e,
+                                            CLOSE_RETRY_BACKOFF_SECS,
+                                        ))).await;
+                                        continue;
+                                    }
+                                }
+                            }
+
+                            if let Some(trade) = position_monitor.remove_trade(&id) {
+                                close_retry_after.remove(&id);
+                                peak_pnl_pct.remove(&id);
+                                let current_price = close_fill_price.unwrap_or(latest_price);
+                                let (gross_pnl, fee_usd, pnl) = compute_trade_pnl_with_fees(
+                                    &trade,
+                                    current_price,
+                                    cfg.execution.fee_bps_per_side.max(0.0),
+                                );
+                                risk.record_trade_pnl(pnl);
+                                tuner.record_trade();
+                                let pnl_pct = if initial_usd > 0.0 {
+                                    (risk.current_equity() - initial_usd) / initial_usd * 100.0
+                                } else {
+                                    0.0
+                                };
+                                aggregator.update_daily_pnl(pnl_pct);
+
+                                let record = TradeRecord {
+                                    id: trade.id,
+                                    ts_open: trade.opened_at,
+                                    ts_close: Some(chrono::Utc::now()),
+                                    duration_secs: Some(
+                                        (chrono::Utc::now() - trade.opened_at)
+                                            .num_seconds()
+                                            .max(0) as u64,
+                                    ),
+                                    play_type: trade.play_type,
+                                    direction: trade.direction,
+                                    signal_level: trade.signal_level,
+                                    signal_score: trade.signal_score,
+                                    entry_price: trade.entry_price,
+                                    exit_price: Some(current_price),
+                                    size_usd: trade.size_usd,
+                                    leverage: trade.leverage,
+                                    pnl_usd: Some(pnl),
+                                    exit_reason: Some("maker_timeout".to_string()),
+                                    llm_reasoning: trade.llm_reasoning.clone(),
+                                    capital_after: Some(risk.current_equity()),
+                                    entry_rsi: trade.entry_rsi,
+                                    entry_cvd: trade.entry_cvd,
+                                    entry_ob: trade.entry_ob,
+                                    entry_atr_pct: trade.entry_atr_pct,
+                                    entry_bb_position: trade.entry_bb_position,
+                                    entry_delta_divergence: trade.entry_delta_divergence.clone(),
+                                };
+                                let _ = journal.log_entry(&record);
+                                if let Some(ref tg) = telegram {
+                                    let r = record.clone();
+                                    let tg_ref = tg.clone();
+                                    tokio::spawn(async move { tg_ref.send_trade_close(&r).await });
+                                }
+                                let _ = tui_tx_clone.send(TuiUpdate::Log(format!(
+                                    "[{}] Maker timeout fallback close {} {} PnL: ${:.2} (gross ${:.2}, fee ${:.2})",
+                                    chrono::Utc::now().format("%H:%M:%S"),
+                                    trade.symbol,
+                                    trade.direction,
+                                    pnl,
+                                    gross_pnl,
+                                    fee_usd,
+                                ))).await;
+                            }
                         }
                     }
                     risk.set_open_positions(position_monitor.open_count(), &cfg);
@@ -732,7 +890,7 @@ async fn main() -> Result<()> {
                                 handle_llm_decision(
                                     &decision, &sl_snapshot, &cfg,
                                     &mut risk, &mut position_monitor, &mut second_look,
-                                    &mut tuner, &mut peak_pnl_pct, &hl_executor, &journal, &tui_tx_clone,
+                                    &mut tuner, &mut peak_pnl_pct, &mut maker_exit_orders, &hl_executor, &journal, &tui_tx_clone,
                                     &telegram, latest_price,
                                 ).await;
                             }
@@ -795,7 +953,7 @@ async fn main() -> Result<()> {
                                         handle_llm_decision(
                                             &decision, &snapshot, &cfg,
                                             &mut risk, &mut position_monitor, &mut second_look,
-                                            &mut tuner, &mut peak_pnl_pct, &hl_executor, &journal, &tui_tx_clone,
+                                            &mut tuner, &mut peak_pnl_pct, &mut maker_exit_orders, &hl_executor, &journal, &tui_tx_clone,
                                             &telegram, latest_price,
                                         ).await;
                                     }
@@ -852,7 +1010,7 @@ async fn main() -> Result<()> {
                                         handle_llm_decision(
                                             &decision, &snapshot, &cfg,
                                             &mut risk, &mut position_monitor, &mut second_look,
-                                            &mut tuner, &mut peak_pnl_pct, &hl_executor, &journal, &tui_tx_clone,
+                                            &mut tuner, &mut peak_pnl_pct, &mut maker_exit_orders, &hl_executor, &journal, &tui_tx_clone,
                                             &telegram, latest_price,
                                         ).await;
                                     }
@@ -1118,6 +1276,7 @@ async fn handle_llm_decision(
     second_look: &mut SecondLookScheduler,
     tuner: &mut SignalTuner,
     peak_pnl_pct: &mut HashMap<Uuid, f64>,
+    maker_exit_orders: &mut HashMap<Uuid, MakerExitState>,
     hl_executor: &Option<HlExecutor>,
     journal: &TradeLogger,
     tui_tx: &mpsc::Sender<TuiUpdate>,
@@ -1157,25 +1316,29 @@ async fn handle_llm_decision(
 
                 for opp_id in &opposite_ids {
                     if let Some(opp_trade) = position_monitor.get_trade(opp_id) {
-                        if let Err(e) = close_trade_on_exchange(&opp_trade, hl_executor).await {
-                            let _ = tui_tx.send(TuiUpdate::Log(format!(
-                                "[{}] Close failed before reverse ({}): {} — keep position",
-                                chrono::Utc::now().format("%H:%M:%S"),
-                                opp_trade.direction,
-                                e,
-                            ))).await;
-                            return;
-                        }
+                        let close_fill_price = match close_trade_on_exchange(&opp_trade, hl_executor).await {
+                            Ok(px) => px,
+                            Err(e) => {
+                                let _ = tui_tx.send(TuiUpdate::Log(format!(
+                                    "[{}] Close failed before reverse ({}): {} — keep position",
+                                    chrono::Utc::now().format("%H:%M:%S"),
+                                    opp_trade.direction,
+                                    e,
+                                ))).await;
+                                return;
+                            }
+                        };
                         let Some(opp_trade) = position_monitor.remove_trade(opp_id) else {
                             continue;
                         };
+                        clear_maker_exit_order(opp_id, maker_exit_orders, hl_executor).await;
                         peak_pnl_pct.remove(opp_id);
-                        let current_price = latest_price;
-                        // size_usd is notional (margin × leverage), so no extra lev multiplier
-                        let pnl = match opp_trade.direction {
-                            Direction::Long => (current_price - opp_trade.entry_price) / opp_trade.entry_price * opp_trade.size_usd,
-                            Direction::Short => (opp_trade.entry_price - current_price) / opp_trade.entry_price * opp_trade.size_usd,
-                        };
+                        let current_price = close_fill_price.unwrap_or(latest_price);
+                        let (gross_pnl, fee_usd, pnl) = compute_trade_pnl_with_fees(
+                            &opp_trade,
+                            current_price,
+                            config.execution.fee_bps_per_side.max(0.0),
+                        );
                         risk.record_trade_pnl(pnl);
                         tuner.record_trade();
                         let record = TradeRecord {
@@ -1213,9 +1376,9 @@ async fn handle_llm_decision(
                             tokio::spawn(async move { tg_ref.send_trade_close(&r).await });
                         }
                         let _ = tui_tx.send(TuiUpdate::Log(format!(
-                            "[{}] {} closed (reversed) PnL: ${:.2}",
+                            "[{}] {} closed (reversed) PnL: ${:.2} (gross ${:.2}, fee ${:.2})",
                             chrono::Utc::now().format("%H:%M:%S"),
-                            opp_trade.direction, pnl,
+                            opp_trade.direction, pnl, gross_pnl, fee_usd,
                         ))).await;
                     }
                 }
@@ -1251,9 +1414,12 @@ async fn handle_llm_decision(
             let round_trip_fee_pct = (config.execution.fee_bps_per_side.max(0.0) * 2.0) / 100.0;
             let tp_fee_floor_pct = round_trip_fee_pct + config.execution.sell_trigger_extra_buffer_pct.max(0.0);
             let effective_take_profit_pct = take_profit_pct.max(tp_fee_floor_pct);
+            let (prefer_maker_exit, exit_mode_reason) = choose_exit_mode(snapshot, config);
+            let trade_id = Uuid::new_v4();
 
             // Place order via HL executor
             let mut entry_price = 0.0;
+            let mut maker_exit_oid: Option<u64> = None;
             if let Some(ref hl) = hl_executor {
                 let is_buy = *direction == Direction::Long;
                 // size_usd is margin; notional = margin × leverage
@@ -1279,7 +1445,37 @@ async fn handle_llm_decision(
                                 entry_price * (1.0 - effective_take_profit_pct / 100.0)
                             };
                             let _ = hl.stop_loss("BTC", sl_price, sz_coin, !is_buy).await;
-                            let _ = hl.take_profit("BTC", tp_price, sz_coin, !is_buy).await;
+                            if prefer_maker_exit {
+                                let maker_tp_price = if is_buy {
+                                    tp_price * (1.0 + config.execution.maker_exit_markup_pct.max(0.0) / 100.0)
+                                } else {
+                                    tp_price * (1.0 - config.execution.maker_exit_markup_pct.max(0.0) / 100.0)
+                                };
+                                match hl
+                                    .reduce_only_limit("BTC", maker_tp_price, sz_coin, !is_buy, true)
+                                    .await
+                                {
+                                    Ok(tp_res) if tp_res.success => {
+                                        maker_exit_oid = tp_res
+                                            .order_id
+                                            .as_deref()
+                                            .and_then(|s| s.parse::<u64>().ok());
+                                        if maker_exit_oid.is_none() {
+                                            let _ = hl.take_profit("BTC", tp_price, sz_coin, !is_buy).await;
+                                        }
+                                    }
+                                    Ok(tp_res) => {
+                                        warn!(msg = %tp_res.message, "Maker TP failed, fallback to trigger TP");
+                                        let _ = hl.take_profit("BTC", tp_price, sz_coin, !is_buy).await;
+                                    }
+                                    Err(e) => {
+                                        warn!("Maker TP placement error, fallback to trigger TP: {e:#}");
+                                        let _ = hl.take_profit("BTC", tp_price, sz_coin, !is_buy).await;
+                                    }
+                                }
+                            } else {
+                                let _ = hl.take_profit("BTC", tp_price, sz_coin, !is_buy).await;
+                            }
                         } else {
                             warn!(msg = %result.message, "Order failed");
                             let _ = tui_tx.send(TuiUpdate::Log(format!(
@@ -1301,7 +1497,7 @@ async fn handle_llm_decision(
             let notional_usd = (size_usd * leverage as f64).max(10.5);
             let ind = &snapshot.indicators;
             let trade = ActiveTrade {
-                id: Uuid::new_v4(),
+                id: trade_id,
                 symbol: Symbol::BTC,
                 direction: *direction,
                 play_type: *play_type,
@@ -1322,10 +1518,18 @@ async fn handle_llm_decision(
                 entry_bb_position: ind.bb_position,
                 entry_delta_divergence: ind.delta_divergence.clone(),
             };
-            let trade_id = trade.id;
             let trade_opened_at = trade.opened_at;
             position_monitor.add_trade(trade);
             peak_pnl_pct.insert(trade_id, 0.0);
+            if let Some(oid) = maker_exit_oid {
+                maker_exit_orders.insert(
+                    trade_id,
+                    MakerExitState {
+                        oid,
+                        placed_at: chrono::Utc::now(),
+                    },
+                );
+            }
             risk.set_open_positions(position_monitor.open_count(), config);
             risk.record_trade_open();
 
@@ -1368,10 +1572,12 @@ async fn handle_llm_decision(
             }
 
             let _ = tui_tx.send(TuiUpdate::Log(format!(
-                "[{}] EXECUTE {} {} ${:.0} @{:.0} lev={} tp={:.3}% (req {:.3}%) — {}",
+                "[{}] EXECUTE {} {} ${:.0} @{:.0} lev={} tp={:.3}% (req {:.3}%) exit={} ({}) — {}",
                 chrono::Utc::now().format("%H:%M:%S"),
                 play_type, direction, notional_usd, entry_price, leverage,
                 effective_take_profit_pct, take_profit_pct,
+                if maker_exit_oid.is_some() { "maker" } else { "trigger" },
+                exit_mode_reason,
                 reasoning,
             ))).await;
         }
@@ -1486,19 +1692,80 @@ fn build_position_context(
     lines.join("\n")
 }
 
+/// Decide whether to use maker-first exit or trigger (taker-style) TP.
+/// High-volatility / trend conditions favor faster taker-style exits.
+fn choose_exit_mode(snapshot: &SignalSnapshot, config: &Config) -> (bool, String) {
+    if !config.execution.enable_maker_exit {
+        return (false, "maker_disabled".to_string());
+    }
+
+    let atr_pct = snapshot.indicators.atr_pct.unwrap_or(0.0);
+    let regime = snapshot.indicators.regime.as_deref();
+    let is_trend = matches!(regime, Some("trend_up") | Some("trend_down"));
+    let max_atr = if is_trend {
+        config.execution.maker_exit_trend_atr_pct
+    } else {
+        config.execution.maker_exit_max_atr_pct
+    };
+
+    if atr_pct > max_atr {
+        return (
+            false,
+            format!("high_vol_atr={:.3}%>{:.3}%", atr_pct, max_atr),
+        );
+    }
+
+    (true, format!("maker_ok_atr={:.3}% regime={}", atr_pct, regime.unwrap_or("na")))
+}
+
 /// Close a tracked trade on exchange. Returns error if order failed, so caller
 /// can keep local state consistent (do NOT mark closed unless exchange close succeeds).
+async fn clear_maker_exit_order(
+    trade_id: &Uuid,
+    maker_exit_orders: &mut HashMap<Uuid, MakerExitState>,
+    hl_executor: &Option<HlExecutor>,
+) {
+    let Some(maker) = maker_exit_orders.remove(trade_id) else {
+        return;
+    };
+    if let Some(hl) = hl_executor {
+        if let Err(e) = hl.cancel_order("BTC", maker.oid).await {
+            warn!(
+                trade_id = %trade_id,
+                oid = maker.oid,
+                error = %e,
+                "Failed to cancel maker exit order"
+            );
+        }
+    }
+}
+
 async fn close_trade_on_exchange(
     trade: &ActiveTrade,
     hl_executor: &Option<HlExecutor>,
-) -> Result<(), String> {
+) -> Result<Option<f64>, String> {
     if let Some(hl) = hl_executor {
         match hl.market_close(trade.symbol.hl_coin()).await {
-            Ok(r) if r.success => Ok(()),
+            Ok(r) if r.success => Ok(r.filled_price),
             Ok(r) => Err(format!("order rejected: {}", r.message)),
             Err(e) => Err(format!("{e:#}")),
         }
     } else {
-        Ok(())
+        Ok(None)
     }
+}
+
+fn compute_trade_pnl_with_fees(
+    trade: &ActiveTrade,
+    exit_price: f64,
+    fee_bps_per_side: f64,
+) -> (f64, f64, f64) {
+    let gross = match trade.direction {
+        Direction::Long => (exit_price - trade.entry_price) / trade.entry_price * trade.size_usd,
+        Direction::Short => (trade.entry_price - exit_price) / trade.entry_price * trade.size_usd,
+    };
+    let fee_rate = (fee_bps_per_side.max(0.0) * 2.0) / 10_000.0;
+    let fee_usd = trade.size_usd * fee_rate;
+    let net = gross - fee_usd;
+    (gross, fee_usd, net)
 }

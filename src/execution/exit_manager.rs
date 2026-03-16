@@ -6,6 +6,15 @@ use uuid::Uuid;
 use crate::config::ExecutionConfig;
 use crate::types::{ActiveTrade, Direction};
 
+#[derive(Debug, Clone)]
+pub struct ProactiveExitDecision {
+    pub id: Uuid,
+    pub reason: String,
+    pub net_pnl_pct: f64,
+    pub peak_pnl_pct: f64,
+    pub elapsed_secs: u64,
+}
+
 fn pnl_pct(trade: &ActiveTrade, current_price: f64) -> f64 {
     match trade.direction {
         Direction::Long => (current_price - trade.entry_price) / trade.entry_price * 100.0,
@@ -26,7 +35,7 @@ pub fn evaluate_proactive_exits(
     now: DateTime<Utc>,
     exec_cfg: &ExecutionConfig,
     peak_pnl_pct: &mut HashMap<Uuid, f64>,
-) -> Vec<(Uuid, String)> {
+) -> Vec<ProactiveExitDecision> {
     if !exec_cfg.enable_proactive_exit || current_price <= 0.0 {
         return Vec::new();
     }
@@ -45,13 +54,25 @@ pub fn evaluate_proactive_exits(
 
         // 1) Early alpha harvest: if the setup works quickly, close quickly.
         if elapsed <= exec_cfg.fast_take_window_secs && net_p >= exec_cfg.fast_take_trigger_pct {
-            exits.push((t.id, "fast_take".to_string()));
+            exits.push(ProactiveExitDecision {
+                id: t.id,
+                reason: "fast_take".to_string(),
+                net_pnl_pct: net_p,
+                peak_pnl_pct: *peak,
+                elapsed_secs: elapsed,
+            });
             continue;
         }
 
         // 2) Profit lock once trade had enough positive excursion.
         if *peak >= exec_cfg.profit_lock_trigger_pct && net_p <= exec_cfg.profit_lock_floor_pct {
-            exits.push((t.id, "profit_lock".to_string()));
+            exits.push(ProactiveExitDecision {
+                id: t.id,
+                reason: "profit_lock".to_string(),
+                net_pnl_pct: net_p,
+                peak_pnl_pct: *peak,
+                elapsed_secs: elapsed,
+            });
             continue;
         }
 
@@ -60,14 +81,35 @@ pub fn evaluate_proactive_exits(
             let giveback_ratio = exec_cfg.peak_giveback_ratio.clamp(0.0, 0.95);
             let giveback_floor = *peak * (1.0 - giveback_ratio);
             if net_p > 0.0 && net_p <= giveback_floor {
-                exits.push((t.id, "giveback_exit".to_string()));
+                exits.push(ProactiveExitDecision {
+                    id: t.id,
+                    reason: "giveback_exit".to_string(),
+                    net_pnl_pct: net_p,
+                    peak_pnl_pct: *peak,
+                    elapsed_secs: elapsed,
+                });
                 continue;
             }
         }
 
-        // 4) Time decay: if trade goes stale with little/negative edge, exit.
-        if elapsed >= exec_cfg.stale_after_secs && net_p <= exec_cfg.stale_min_pnl_pct {
-            exits.push((t.id, "stale_exit".to_string()));
+        // 4) Time decay: stale exit is only for small-drift trades.
+        // Deep losers should be handled by stop-loss, not mislabeled as stale.
+        // Also avoid stale-exiting if price action is still gross-positive (fees alone would
+        // make it look net-negative) or if trade already showed meaningful early edge.
+        if exec_cfg.enable_stale_exit
+            && elapsed >= exec_cfg.stale_after_secs
+            && net_p <= 0.0
+            && net_p >= exec_cfg.stale_min_pnl_pct
+            && gross_p <= 0.0
+            && *peak < exec_cfg.fast_take_trigger_pct
+        {
+            exits.push(ProactiveExitDecision {
+                id: t.id,
+                reason: "stale_exit".to_string(),
+                net_pnl_pct: net_p,
+                peak_pnl_pct: *peak,
+                elapsed_secs: elapsed,
+            });
             continue;
         }
     }

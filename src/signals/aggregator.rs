@@ -384,6 +384,31 @@ impl SignalAggregator {
             ));
         }
 
+        // Regime guardrail: block weak counter-trend entries.
+        // Strong counter-trend setups are still allowed when conviction is high.
+        if let (Some(e9), Some(e21)) = (self.indicators.ema_9(), self.indicators.ema_21()) {
+            if self.latest_price > 0.0 {
+                let spread_pct = ((e9 - e21).abs() / self.latest_price) * 100.0;
+                if spread_pct >= config.signals.regime_trend_spread_pct {
+                    if e9 > e21
+                        && net_score < 0
+                        && net_score > -config.signals.strong_threshold
+                    {
+                        return Some(format!(
+                            "Counter-trend short blocked in trend_up (net={})",
+                            net_score
+                        ));
+                    }
+                    if e9 < e21 && net_score > 0 && net_score < config.signals.strong_threshold {
+                        return Some(format!(
+                            "Counter-trend long blocked in trend_down (net={})",
+                            net_score
+                        ));
+                    }
+                }
+            }
+        }
+
         // VWAP anti-chasing filter: avoid entering when price is already overextended
         // away from VWAP in the same trade direction.
         if let Some(vwap) = self.indicators.vwap_1m(20) {
@@ -396,6 +421,18 @@ impl SignalAggregator {
                 if net_score < 0 && dev_pct < -band {
                     return Some(format!("Price {:+.2}% below VWAP (short overextended)", dev_pct));
                 }
+            }
+        }
+
+        // Band-edge trap filter:
+        // avoid opening fresh shorts at lower-band extremes and longs at upper-band extremes.
+        // This removes repeated "already stretched" entries that often mean-revert fast.
+        if let Some(pos) = self.indicators.bb_position(self.latest_price) {
+            if net_score < 0 && pos <= -0.6 {
+                return Some(format!("BB lower-extreme {:.2} (avoid fresh short)", pos));
+            }
+            if net_score > 0 && pos >= 0.6 {
+                return Some(format!("BB upper-extreme {:.2} (avoid fresh long)", pos));
             }
         }
 

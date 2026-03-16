@@ -215,7 +215,9 @@ impl App {
                     format!(" {:+.2}%", self.daily_pnl_pct),
                     Style::default().fg(daily_pnl_color),
                 ),
-                Span::styled("  FeeRT:", Style::default().fg(Color::Cyan)),
+            ]),
+            Line::from(vec![
+                Span::styled(" FeeRT:", Style::default().fg(Color::Cyan)),
                 Span::styled(
                     format!(" {:.3}%", self.fee_round_trip_pct),
                     Style::default().fg(Color::DarkGray),

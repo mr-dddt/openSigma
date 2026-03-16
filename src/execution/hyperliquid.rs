@@ -3,7 +3,7 @@ use ethers::signers::{LocalWallet, Signer};
 use tracing::{info, warn};
 
 use hyperliquid_rust_sdk::{
-    BaseUrl, ClientOrder, ClientOrderRequest, ClientTrigger,
+    BaseUrl, ClientCancelRequest, ClientLimit, ClientOrder, ClientOrderRequest, ClientTrigger,
     ExchangeClient, ExchangeResponseStatus, ExchangeDataStatus,
     InfoClient, MarketCloseParams, MarketOrderParams,
 };
@@ -210,6 +210,46 @@ impl HlExecutor {
 
         let result = self.exchange.order(order, None).await;
         Self::parse_response(result)
+    }
+
+    /// Place a reduce-only limit order. Use post_only=true for maker exits.
+    pub async fn reduce_only_limit(
+        &self,
+        coin: &str,
+        limit_px: f64,
+        sz: f64,
+        is_buy: bool,
+        post_only: bool,
+    ) -> Result<OrderResult> {
+        let tif = if post_only { "Alo" } else { "Gtc" };
+        let order = ClientOrderRequest {
+            asset: coin.to_string(),
+            is_buy,
+            reduce_only: true,
+            limit_px,
+            sz,
+            cloid: None,
+            order_type: ClientOrder::Limit(ClientLimit {
+                tif: tif.to_string(),
+            }),
+        };
+        let result = self.exchange.order(order, None).await;
+        Self::parse_response(result)
+    }
+
+    /// Cancel an existing order by oid. Best-effort cleanup for stale maker exits.
+    pub async fn cancel_order(&self, coin: &str, oid: u64) -> Result<()> {
+        self.exchange
+            .cancel(
+                ClientCancelRequest {
+                    asset: coin.to_string(),
+                    oid,
+                },
+                None,
+            )
+            .await
+            .map(|_| ())
+            .map_err(|e| anyhow::anyhow!("Failed to cancel order {oid}: {e:?}"))
     }
 
     /// Query current positions via InfoClient.

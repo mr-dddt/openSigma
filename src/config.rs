@@ -83,6 +83,8 @@ pub struct ExecutionConfig {
     pub stale_after_secs: u64,
     #[serde(default = "default_stale_min_pnl_pct")]
     pub stale_min_pnl_pct: f64,
+    #[serde(default)]
+    pub enable_stale_exit: bool,
     #[serde(default = "default_idle_llm_ping_secs")]
     pub idle_llm_ping_secs: u64,
     /// Estimated taker fee in bps per side (entry or exit).
@@ -91,6 +93,21 @@ pub struct ExecutionConfig {
     /// Extra sell-trigger buffer (%) above fees to avoid micro-profit churn.
     #[serde(default = "default_sell_trigger_extra_buffer_pct")]
     pub sell_trigger_extra_buffer_pct: f64,
+    /// Prefer post-only maker limit for exits (reduce-only).
+    #[serde(default = "default_true")]
+    pub enable_maker_exit: bool,
+    /// Max seconds to wait for maker exit fill before market fallback.
+    #[serde(default = "default_maker_exit_timeout_secs")]
+    pub maker_exit_timeout_secs: u64,
+    /// Extra offset (%) applied to TP when posting maker exit.
+    #[serde(default = "default_maker_exit_markup_pct")]
+    pub maker_exit_markup_pct: f64,
+    /// If ATR% is above this, use taker-style TP (trigger) instead of maker.
+    #[serde(default = "default_maker_exit_max_atr_pct")]
+    pub maker_exit_max_atr_pct: f64,
+    /// In trend regimes, switch to taker TP sooner for faster execution.
+    #[serde(default = "default_maker_exit_trend_atr_pct")]
+    pub maker_exit_trend_atr_pct: f64,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -191,6 +208,10 @@ fn default_stale_min_pnl_pct() -> f64 { 0.02 }
 fn default_idle_llm_ping_secs() -> u64 { 60 }
 fn default_fee_bps_per_side() -> f64 { 3.5 }
 fn default_sell_trigger_extra_buffer_pct() -> f64 { 0.02 }
+fn default_maker_exit_timeout_secs() -> u64 { 35 }
+fn default_maker_exit_markup_pct() -> f64 { 0.01 }
+fn default_maker_exit_max_atr_pct() -> f64 { 0.23 }
+fn default_maker_exit_trend_atr_pct() -> f64 { 0.16 }
 
 #[derive(Debug, Clone, Deserialize)]
 pub struct TuningConfig {

@@ -24,8 +24,8 @@ Respond with ONLY a valid JSON object — one of three variants:
 AGGRESSIVE SCALPING RULES:
 - You are biased toward EXECUTE. Only SKIP when signals clearly conflict.
 - Default leverage: 20-30x. Use 30-50x on STRONG signals.
-- stop_loss_pct: 0.05-0.15% of PRICE. Keep stops TIGHT.
-- take_profit_pct: 0.1-0.25% of PRICE. Take profits quickly.
+- stop_loss_pct: 0.08-0.25% of PRICE. Avoid ultra-tight stops in noise.
+- take_profit_pct: 0.15-0.45% of PRICE. Let winners breathe when momentum persists.
 - size_pct: use 5-10% of capital per trade.
 - hl_leverage MUST NOT exceed max_leverage from config
 - size_pct MUST NOT exceed max_trade_pct from config
