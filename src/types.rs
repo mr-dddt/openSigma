@@ -79,6 +79,14 @@ pub struct FundingTick {
 
 #[allow(dead_code)]
 #[derive(Debug, Clone)]
+pub struct OpenInterestTick {
+    pub symbol: Symbol,
+    pub value: f64,
+    pub timestamp: DateTime<Utc>,
+}
+
+#[allow(dead_code)]
+#[derive(Debug, Clone)]
 pub struct LiquidationTick {
     pub symbol: Symbol,
     pub direction: Direction,
@@ -110,6 +118,7 @@ pub enum MarketEvent {
     Trade(TradeTick),
     OrderBook(OrderBookSnapshot),
     Funding(FundingTick),
+    OpenInterest(OpenInterestTick),
     Liquidation(LiquidationTick),
 }
 
@@ -173,6 +182,10 @@ pub struct IndicatorValues {
     pub ema_spread_pct: Option<f64>,
     pub vwap: Option<f64>,
     pub vwap_dev_pct: Option<f64>,
+    pub delta_divergence: Option<String>,
+    pub open_interest: Option<f64>,
+    pub oi_delta_pct: Option<f64>,
+    pub oi_bias: Option<String>,
 }
 
 // ---------------------------------------------------------------------------
@@ -267,6 +280,8 @@ pub struct TradeRecord {
     pub entry_atr_pct: Option<f64>,
     #[serde(default)]
     pub entry_bb_position: Option<f64>,
+    #[serde(default)]
+    pub entry_delta_divergence: Option<String>,
 }
 
 // ---------------------------------------------------------------------------
@@ -295,6 +310,7 @@ pub struct ActiveTrade {
     pub entry_ob: Option<f64>,
     pub entry_atr_pct: Option<f64>,
     pub entry_bb_position: Option<f64>,
+    pub entry_delta_divergence: Option<String>,
 }
 
 // ---------------------------------------------------------------------------

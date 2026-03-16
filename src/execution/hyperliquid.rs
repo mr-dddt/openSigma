@@ -5,7 +5,7 @@ use tracing::{info, warn};
 use hyperliquid_rust_sdk::{
     BaseUrl, ClientOrder, ClientOrderRequest, ClientTrigger,
     ExchangeClient, ExchangeResponseStatus, ExchangeDataStatus,
-    InfoClient, MarketOrderParams,
+    InfoClient, MarketCloseParams, MarketOrderParams,
 };
 
 /// Lightweight account state query — no signing needed, just reads.
@@ -131,6 +131,33 @@ impl HlExecutor {
             .await;
 
         Self::parse_response(result)
+    }
+
+    /// Close the current position for an asset using reduce-only market close.
+    /// This is safer than reconstructing size client-side and avoids stale-size
+    /// close rejects when local state drifts from exchange state.
+    pub async fn market_close(&self, coin: &str) -> Result<OrderResult> {
+        let result = self
+            .exchange
+            .market_close(MarketCloseParams {
+                asset: coin,
+                sz: None, // close full position
+                px: None,
+                slippage: Some(0.05),
+                cloid: None,
+                wallet: None,
+            })
+            .await;
+
+        match result {
+            Err(hyperliquid_rust_sdk::Error::AssetNotFound) => Ok(OrderResult {
+                success: true,
+                order_id: None,
+                filled_price: None,
+                message: "no open position on exchange".to_string(),
+            }),
+            other => Self::parse_response(other),
+        }
     }
 
     /// Place a stop-loss trigger order via SDK.

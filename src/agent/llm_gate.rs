@@ -97,7 +97,7 @@ impl LlmGate {
             "Signal: {} (net_score={}, bull={}, bear={})\n\
              EMA9={:.1} EMA21={:.1} RSI={:.1} StochRSI={:.1}\n\
              CVD={:.2} OB_Imbalance={:.2} ATR%={:.3} Funding%={:.4}\n\
-             VWAP={:.1} VWAP_dev%={:+.3}\n\
+             VWAP={:.1} VWAP_dev%={:+.3} OI={:.0} OI_delta%={:+.3} OI_bias={}\n\
              BB: {}\n\
              Session: {} (size_mult={:.1})\n\
              Config: max_trade_pct={:.1}, max_leverage={}, max_duration={}s\n\
@@ -117,6 +117,9 @@ impl LlmGate {
             ind.funding_rate.unwrap_or(0.0),
             ind.vwap.unwrap_or(0.0),
             ind.vwap_dev_pct.unwrap_or(0.0),
+            ind.open_interest.unwrap_or(0.0),
+            ind.oi_delta_pct.unwrap_or(0.0),
+            ind.oi_bias.as_deref().unwrap_or("n/a"),
             bb_state,
             if in_session { "active" } else { "inactive" },
             size_mult,

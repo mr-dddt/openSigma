@@ -2,6 +2,18 @@ use std::collections::VecDeque;
 
 use crate::types::Candle;
 
+#[derive(Debug, Clone, Copy)]
+struct PriceCvdPoint {
+    price: f64,
+    cvd: f64,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DeltaDivergence {
+    Bullish,
+    Bearish,
+}
+
 /// Rolling indicator calculator. Maintains candle history and computes
 /// EMA, RSI, Stochastic RSI, Bollinger Bands, ATR, and CVD.
 pub struct Indicators {
@@ -15,6 +27,8 @@ pub struct Indicators {
     cvd_reset_at: Option<chrono::DateTime<chrono::Utc>>,
     /// Recent CVD snapshots for momentum (slope) estimation.
     cvd_samples: VecDeque<f64>,
+    /// 1m snapshots for price-vs-CVD divergence detection.
+    price_cvd_samples: VecDeque<PriceCvdPoint>,
     /// Max candles to keep
     max_candles: usize,
 }
@@ -28,6 +42,7 @@ impl Indicators {
             cvd_sells: 0.0,
             cvd_reset_at: None,
             cvd_samples: VecDeque::new(),
+            price_cvd_samples: VecDeque::new(),
             max_candles: 200,
         }
     }
@@ -37,6 +52,13 @@ impl Indicators {
         self.candles_1m.push_back(candle);
         if self.candles_1m.len() > self.max_candles {
             self.candles_1m.pop_front();
+        }
+        self.price_cvd_samples.push_back(PriceCvdPoint {
+            price: self.candles_1m.back().map(|c| c.close).unwrap_or(0.0),
+            cvd: self.cvd(),
+        });
+        if self.price_cvd_samples.len() > self.max_candles {
+            self.price_cvd_samples.pop_front();
         }
     }
 
@@ -363,6 +385,31 @@ impl Indicators {
         }
         let n = self.cvd_samples.len();
         Some(self.cvd_samples[n - 1] - self.cvd_samples[n - 6])
+    }
+
+    /// Detects CVD/price delta divergence:
+    /// - Bearish: price makes a new local high but CVD does not confirm.
+    /// - Bullish: price makes a new local low but CVD does not confirm.
+    pub fn delta_divergence(&self, lookback_bars: usize) -> Option<DeltaDivergence> {
+        if lookback_bars < 3 || self.price_cvd_samples.len() < lookback_bars + 1 {
+            return None;
+        }
+
+        let n = self.price_cvd_samples.len();
+        let samples: Vec<PriceCvdPoint> = self.price_cvd_samples.iter().copied().collect();
+        let current = samples[n - 1];
+        let prev_window = &samples[n - 1 - lookback_bars..n - 1];
+
+        let prev_high = prev_window.iter().max_by(|a, b| a.price.total_cmp(&b.price))?;
+        let prev_low = prev_window.iter().min_by(|a, b| a.price.total_cmp(&b.price))?;
+
+        if current.price > prev_high.price && current.cvd < prev_high.cvd {
+            return Some(DeltaDivergence::Bearish);
+        }
+        if current.price < prev_low.price && current.cvd > prev_low.cvd {
+            return Some(DeltaDivergence::Bullish);
+        }
+        None
     }
 
     /// CVD direction: positive = net buying, negative = net selling.

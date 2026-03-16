@@ -14,6 +14,22 @@ max_leverage = 50
 max_trade_duration_secs = 1800
 max_second_looks = 3
 signal_eval_interval_secs = 5
+enable_proactive_exit = true
+# Aggressive 15s-edge profile:
+# - harvest small early edge quickly
+# - protect winners from round-trip
+# - cut stale trades sooner
+# - keep logs/LLM heartbeat active in slow regimes
+fast_take_window_secs = 18
+fast_take_trigger_pct = 0.06
+profit_lock_trigger_pct = 0.08
+profit_lock_floor_pct = 0.015
+peak_giveback_ratio = 0.35
+stale_after_secs = 20
+stale_min_pnl_pct = 0.03
+idle_llm_ping_secs = 45
+fee_bps_per_side = 3.5
+sell_trigger_extra_buffer_pct = 0.02
 
 [sessions.ny_kill_zone]
 start = "13:30"
@@ -55,6 +71,10 @@ ob_strong_threshold = 1.7
 regime_trend_spread_pct = 0.03
 vwap_dev_reversion_pct = 0.30
 vwap_weight = 1
+delta_div_lookback_bars = 12
+delta_div_weight = 2
+oi_weight = 1
+oi_delta_min_pct = 0.03
 
 [tuning]
 tune_every_n_trades = 5

@@ -68,6 +68,7 @@ pub struct App {
     pub initial_equity: f64,
     #[allow(dead_code)]
     pub config_initial_usd: f64,
+    pub fee_round_trip_pct: f64,
     pub equity: f64,
     pub total_pnl_pct: f64,
     pub daily_pnl_pct: f64,
@@ -80,7 +81,7 @@ pub struct App {
 }
 
 impl App {
-    pub fn new(initial_equity: f64, config_initial_usd: f64) -> Self {
+    pub fn new(initial_equity: f64, config_initial_usd: f64, fee_round_trip_pct: f64) -> Self {
         let today = Utc::now().ordinal();
         let start_of_day_equity = match load_daily_state() {
             Some(state) if state.date == Utc::now().format("%Y-%m-%d").to_string() => {
@@ -98,6 +99,7 @@ impl App {
             trade_log: Vec::new(),
             initial_equity,
             config_initial_usd,
+            fee_round_trip_pct,
             equity: initial_equity,
             total_pnl_pct: 0.0,
             daily_pnl_pct: 0.0,
@@ -163,7 +165,7 @@ impl App {
         let chunks = Layout::default()
             .direction(ratatui::layout::Direction::Vertical)
             .constraints([
-                Constraint::Length(8),         // top: status + signal
+                Constraint::Length(9),         // top: status + signal
                 Constraint::Length(pos_height), // positions: grows with count
                 Constraint::Min(6),            // log
                 Constraint::Length(3),          // footer: stats + keys
@@ -212,6 +214,11 @@ impl App {
                 Span::styled(
                     format!(" {:+.2}%", self.daily_pnl_pct),
                     Style::default().fg(daily_pnl_color),
+                ),
+                Span::styled("  FeeRT:", Style::default().fg(Color::Cyan)),
+                Span::styled(
+                    format!(" {:.3}%", self.fee_round_trip_pct),
+                    Style::default().fg(Color::DarkGray),
                 ),
             ]),
         ];
@@ -285,6 +292,32 @@ impl App {
                                 .unwrap_or_else(|| "n/a".to_string())
                         ),
                         Style::default().fg(vwap_dev_color(ind.vwap_dev_pct)),
+                    ),
+                    Span::styled("  ΔDiv:", Style::default().fg(Color::Cyan)),
+                    Span::styled(
+                        format!(" {}", delta_div_label(ind)),
+                        Style::default().fg(delta_div_color(ind)),
+                    ),
+                ]),
+                Line::from(vec![
+                    Span::styled(" OI:", Style::default().fg(Color::Cyan)),
+                    Span::raw(format!(
+                        " {}",
+                        ind.open_interest
+                            .map(|v| format!("{v:.0}"))
+                            .unwrap_or_else(|| "n/a".to_string())
+                    )),
+                    Span::styled("  OIΔ%:", Style::default().fg(Color::Cyan)),
+                    Span::raw(format!(
+                        " {}",
+                        ind.oi_delta_pct
+                            .map(|v| format!("{v:+.3}"))
+                            .unwrap_or_else(|| "n/a".to_string())
+                    )),
+                    Span::styled("  OI Bias:", Style::default().fg(Color::Cyan)),
+                    Span::styled(
+                        format!(" {}", oi_bias_label(ind)),
+                        Style::default().fg(oi_bias_color(ind)),
                     ),
                 ]),
                 Line::from(vec![
@@ -503,6 +536,44 @@ fn vwap_dev_color(dev: Option<f64>) -> Color {
         Some(v) if v <= -0.3 => Color::Green,
         Some(_) => Color::DarkGray,
         None => Color::DarkGray,
+    }
+}
+
+fn delta_div_label(ind: &crate::types::IndicatorValues) -> &'static str {
+    match ind.delta_divergence.as_deref() {
+        Some("bullish") => "BULL",
+        Some("bearish") => "BEAR",
+        _ => "-",
+    }
+}
+
+fn delta_div_color(ind: &crate::types::IndicatorValues) -> Color {
+    match ind.delta_divergence.as_deref() {
+        Some("bullish") => Color::Green,
+        Some("bearish") => Color::Red,
+        _ => Color::DarkGray,
+    }
+}
+
+fn oi_bias_label(ind: &crate::types::IndicatorValues) -> &'static str {
+    match ind.oi_bias.as_deref() {
+        Some("bullish_confirm") => "BULL",
+        Some("bearish_confirm") => "BEAR",
+        Some("possible_bottom") => "BOT?",
+        Some("caution_short_cover") => "CAUT",
+        Some("neutral") => "NEU",
+        _ => "-",
+    }
+}
+
+fn oi_bias_color(ind: &crate::types::IndicatorValues) -> Color {
+    match ind.oi_bias.as_deref() {
+        Some("bullish_confirm") => Color::Green,
+        Some("bearish_confirm") => Color::Red,
+        Some("possible_bottom") => Color::Yellow,
+        Some("caution_short_cover") => Color::Magenta,
+        Some("neutral") => Color::DarkGray,
+        _ => Color::DarkGray,
     }
 }
 

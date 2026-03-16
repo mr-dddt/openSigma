@@ -9,7 +9,7 @@ use crate::agent::llm_client::LlmClient;
 use crate::journal::memory::MemoryManager;
 use crate::types::{PlayType, TradeRecord};
 
-const REPORT_SYSTEM_PROMPT: &str = r#"You are openSigma's trade analyst. Given a batch of recent trades with detailed entry conditions (RSI, CVD, OB, ATR%, BB position), performance metrics, and current signal params, identify patterns and suggest improvements.
+const REPORT_SYSTEM_PROMPT: &str = r#"You are openSigma's trade analyst. Given a batch of recent trades with detailed entry conditions (RSI, CVD, OB, ATR%, BB position, delta_divergence), performance metrics, and current signal params, identify patterns and suggest improvements.
 
 Respond with ONLY a valid JSON object:
 {
@@ -20,7 +20,7 @@ Respond with ONLY a valid JSON object:
 }
 
 Rules:
-- Use the per-trade entry conditions (rsi, cvd, ob, atr_pct, bb_position) to find what setups work/fail. Refer to concrete values (e.g. "Longs when RSI<35 and CVD>0 won 80%").
+- Use the per-trade entry conditions (rsi, cvd, ob, atr_pct, bb_position, delta_divergence) to find what setups work/fail. Refer to concrete values (e.g. "Longs when RSI<35 and CVD>0 won 80%").
 - memory_rules: 0-3 max, actionable (e.g. "When RSI<30 and CVD>0, lean_long wins often — consider lower lean_threshold" or "Strong entries after 3 losses tend to fail").
 - param_adjustments: optional. Suggest 0-3 signal param changes when data supports it. Supported params: strong_threshold (int), lean_threshold (int), min_atr_pct (float), rsi_oversold (float), rsi_overbought (float), vwap_dev_reversion_pct (float), vwap_weight (int). reason must cite the condition (e.g. "strong_threshold=5 too strict when RSI<35; wins at score 4").
 - Keep summary concise — shown in TUI and Telegram.
@@ -170,7 +170,7 @@ impl Reporter {
             .take(3)
             .map(|t| {
                 format!(
-                    "- {} score={} rsi={} cvd={} ob={} atr%={} bb={} -> {} (${:.2})",
+                    "- {} score={} rsi={} cvd={} ob={} atr%={} bb={} div={} -> {} (${:.2})",
                     t.signal_level,
                     t.signal_score,
                     t.entry_rsi.map_or("n/a".to_string(), |v| format!("{v:.1}")),
@@ -178,6 +178,7 @@ impl Reporter {
                     t.entry_ob.map_or("n/a".to_string(), |v| format!("{v:.2}")),
                     t.entry_atr_pct.map_or("n/a".to_string(), |v| format!("{v:.2}")),
                     t.entry_bb_position.map_or("n/a".to_string(), |v| format!("{v:.2}")),
+                    t.entry_delta_divergence.as_deref().unwrap_or("n/a"),
                     t.exit_reason.as_deref().unwrap_or("?"),
                     t.pnl_usd.unwrap_or(0.0),
                 )
@@ -190,7 +191,7 @@ impl Reporter {
             .take(3)
             .map(|t| {
                 format!(
-                    "- {} score={} rsi={} cvd={} ob={} atr%={} bb={} -> {} (${:.2})",
+                    "- {} score={} rsi={} cvd={} ob={} atr%={} bb={} div={} -> {} (${:.2})",
                     t.signal_level,
                     t.signal_score,
                     t.entry_rsi.map_or("n/a".to_string(), |v| format!("{v:.1}")),
@@ -198,6 +199,7 @@ impl Reporter {
                     t.entry_ob.map_or("n/a".to_string(), |v| format!("{v:.2}")),
                     t.entry_atr_pct.map_or("n/a".to_string(), |v| format!("{v:.2}")),
                     t.entry_bb_position.map_or("n/a".to_string(), |v| format!("{v:.2}")),
+                    t.entry_delta_divergence.as_deref().unwrap_or("n/a"),
                     t.exit_reason.as_deref().unwrap_or("?"),
                     t.pnl_usd.unwrap_or(0.0),
                 )
@@ -260,8 +262,9 @@ impl Reporter {
                 let ob = t.entry_ob.map_or("n/a".to_string(), |v| format!("{v:.2}"));
                 let atr = t.entry_atr_pct.map_or("n/a".to_string(), |v| format!("{v:.2}"));
                 let bb = t.entry_bb_position.map_or("n/a".to_string(), |v| format!("{v:.2}"));
+                let div = t.entry_delta_divergence.as_deref().unwrap_or("n/a").to_string();
                 format!(
-                    "  #{} {} {} | rsi={} cvd={} ob={} atr%={} bb_pos={} | level={} score={} | exit={} {} | dur={}s | {}",
+                    "  #{} {} {} | rsi={} cvd={} ob={} atr%={} bb_pos={} div={} | level={} score={} | exit={} {} | dur={}s | {}",
                     t.id,
                     t.direction,
                     t.play_type,
@@ -270,6 +273,7 @@ impl Reporter {
                     ob,
                     atr,
                     bb,
+                    div,
                     t.signal_level,
                     t.signal_score,
                     t.exit_reason.as_deref().unwrap_or("?"),
@@ -298,7 +302,7 @@ impl Reporter {
             .join("\n");
 
         format!(
-            "Trade batch ({} trades) — each line: entry conditions (rsi, cvd, ob, atr%%, bb_pos), level/score, exit reason, outcome, duration, LLM reasoning snippet:\n{}\n\n\
+            "Trade batch ({} trades) — each line: entry conditions (rsi, cvd, ob, atr%%, bb_pos, div), level/score, exit reason, outcome, duration, LLM reasoning snippet:\n{}\n\n\
              Metrics:\n\
              - Win rate: {:.1}% ({}/{})\n\
              - Net PnL: ${:.2}\n\
@@ -394,7 +398,7 @@ impl Reporter {
                     "fail"
                 };
                 format!(
-                    "| {} | {} | {} | {:.2} | {} | {} | {} | {} | {} | {} | {} | {} | {} |",
+                    "| {} | {} | {} | {:.2} | {} | {} | {} | {} | {} | {} | {} | {} | {} | {} |",
                     t.id,
                     t.direction,
                     t.play_type,
@@ -406,6 +410,7 @@ impl Reporter {
                     t.entry_ob.map_or("n/a".to_string(), |v| format!("{v:.2}")),
                     t.entry_atr_pct.map_or("n/a".to_string(), |v| format!("{v:.2}")),
                     t.entry_bb_position.map_or("n/a".to_string(), |v| format!("{v:.2}")),
+                    t.entry_delta_divergence.as_deref().unwrap_or("n/a"),
                     t.exit_reason.as_deref().unwrap_or("?"),
                     outcome,
                 )
@@ -439,8 +444,8 @@ impl Reporter {
              |------|-------|------|---------|\n\
              {play_types}\n\n\
              ## Condition Snapshots (what worked/failed)\n\
-             | Trade | Dir | Play | PnL | Level | Score | RSI | CVD | OB | ATR% | BB Pos | Exit | Outcome |\n\
-             |------|-----|------|-----|-------|-------|-----|-----|----|------|--------|------|---------|\n\
+             | Trade | Dir | Play | PnL | Level | Score | RSI | CVD | OB | ATR% | BB Pos | ΔDiv | Exit | Outcome |\n\
+             |------|-----|------|-----|-------|-------|-----|-----|----|------|--------|------|------|---------|\n\
              {condition_table}\n\n\
              ## Trigger Reasons (LLM response excerpts)\n\
              {trigger_reasons}\n\n\

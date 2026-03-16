@@ -8,6 +8,7 @@ mod telegram;
 mod tui;
 mod types;
 
+use std::collections::HashMap;
 use std::sync::Arc;
 
 use anyhow::Result;
@@ -25,6 +26,7 @@ use crate::data::hyperliquid::{self, HyperliquidFeed};
 use crate::data::news::NewsFeed;
 use crate::execution::hyperliquid::{HlExecutor, HlPosition, query_account_state};
 use ethers::signers::Signer as _;
+use crate::execution::exit_manager::evaluate_proactive_exits;
 use crate::execution::kill_switch::KillSwitch;
 use crate::execution::position_monitor::{PositionEvent, PositionMonitor};
 use crate::execution::risk::RiskChecker;
@@ -245,6 +247,7 @@ async fn main() -> Result<()> {
                         entry_ob: None,
                         entry_atr_pct: None,
                         entry_bb_position: None,
+                        entry_delta_divergence: None,
                     };
                     info!(
                         coin = %pos.coin, direction = %direction,
@@ -350,9 +353,15 @@ async fn main() -> Result<()> {
     let engine_handle = tokio::spawn(async move {
         const LLM_SKIP_COOLDOWN_SECS: i64 = 20;
         const LLM_EXECUTE_COOLDOWN_SECS: i64 = 45;
+        const CLOSE_RETRY_BACKOFF_SECS: i64 = 3;
         let mut llm_cooldown_until: Option<chrono::DateTime<chrono::Utc>> = None;
+        let mut last_signal_fingerprint: Option<String> = None;
+        let mut last_signal_change_at = chrono::Utc::now();
+        let mut last_idle_llm_at: Option<chrono::DateTime<chrono::Utc>> = None;
 
         let mut latest_price: f64 = 0.0;
+        let mut close_retry_after: HashMap<Uuid, chrono::DateTime<chrono::Utc>> = HashMap::new();
+        let mut peak_pnl_pct: HashMap<Uuid, f64> = HashMap::new();
 
         loop {
             tokio::select! {
@@ -375,20 +384,34 @@ async fn main() -> Result<()> {
                                             PositionEvent::TakeProfitHit(_) => "take_profit",
                                             _ => "unknown",
                                         };
+                                        let now = chrono::Utc::now();
+                                        if close_retry_after
+                                            .get(&id)
+                                            .is_some_and(|next_try| now < *next_try)
+                                        {
+                                            continue;
+                                        }
                                         if let Some(trade_snapshot) = position_monitor.get_trade(&id) {
                                             if let Err(e) = close_trade_on_exchange(&trade_snapshot, &hl_executor).await {
+                                                close_retry_after.insert(
+                                                    id,
+                                                    now + chrono::Duration::seconds(CLOSE_RETRY_BACKOFF_SECS),
+                                                );
                                                 let _ = tui_tx_clone.send(TuiUpdate::Log(format!(
-                                                    "[{}] Close failed ({}) {} {}: {} — still open",
+                                                    "[{}] Close failed ({}) {} {}: {} — retry in {}s",
                                                     chrono::Utc::now().format("%H:%M:%S"),
                                                     reason,
                                                     trade_snapshot.symbol,
                                                     trade_snapshot.direction,
                                                     e,
+                                                    CLOSE_RETRY_BACKOFF_SECS,
                                                 ))).await;
                                                 continue;
                                             }
                                         }
                                         if let Some(trade) = position_monitor.remove_trade(&id) {
+                                            close_retry_after.remove(&id);
+                                            peak_pnl_pct.remove(&id);
                                             let exit_price = latest_price;
                                             let pnl = match trade.direction {
                                                 Direction::Long => (exit_price - trade.entry_price) / trade.entry_price * trade.size_usd,
@@ -425,6 +448,7 @@ async fn main() -> Result<()> {
                                                 entry_ob: trade.entry_ob,
                                                 entry_atr_pct: trade.entry_atr_pct,
                                                 entry_bb_position: trade.entry_bb_position,
+                                                entry_delta_divergence: trade.entry_delta_divergence.clone(),
                                             };
                                             let _ = journal.log_entry(&record);
 
@@ -474,6 +498,11 @@ async fn main() -> Result<()> {
                                 aggregator.update_funding(tick.rate);
                             }
                         }
+                        MarketEvent::OpenInterest(tick) => {
+                            if tick.symbol == Symbol::BTC {
+                                aggregator.update_open_interest(tick.value);
+                            }
+                        }
                         MarketEvent::Liquidation(_) => {}
                     }
                 }
@@ -488,24 +517,52 @@ async fn main() -> Result<()> {
                     let snapshot = aggregator.evaluate(&cfg);
                     let _ = tui_tx_clone.send(TuiUpdate::Signal(snapshot.clone())).await;
                     let has_signal = snapshot.level != SignalLevel::NoTrade && snapshot.level != SignalLevel::Weak;
+                    let signal_fingerprint = format!(
+                        "{}|{}|{}",
+                        snapshot.level,
+                        snapshot.net_score,
+                        snapshot.filter_reason.as_deref().unwrap_or("none"),
+                    );
+                    if last_signal_fingerprint
+                        .as_ref()
+                        .map(|s| s != &signal_fingerprint)
+                        .unwrap_or(true)
+                    {
+                        last_signal_fingerprint = Some(signal_fingerprint);
+                        last_signal_change_at = chrono::Utc::now();
+                    }
 
                     // Check position expirations (max hold time)
                     let expired = position_monitor.check_expirations();
                     let mut any_expired_closed = false;
                     for id in expired {
+                        let now = chrono::Utc::now();
+                        if close_retry_after
+                            .get(&id)
+                            .is_some_and(|next_try| now < *next_try)
+                        {
+                            continue;
+                        }
                         if let Some(trade_snapshot) = position_monitor.get_trade(&id) {
                             if let Err(e) = close_trade_on_exchange(&trade_snapshot, &hl_executor).await {
+                                close_retry_after.insert(
+                                    id,
+                                    now + chrono::Duration::seconds(CLOSE_RETRY_BACKOFF_SECS),
+                                );
                                 let _ = tui_tx_clone.send(TuiUpdate::Log(format!(
-                                    "[{}] Expire close failed {} {}: {} — still open",
+                                    "[{}] Expire close failed {} {}: {} — retry in {}s",
                                     chrono::Utc::now().format("%H:%M:%S"),
                                     trade_snapshot.symbol,
                                     trade_snapshot.direction,
                                     e,
+                                    CLOSE_RETRY_BACKOFF_SECS,
                                 ))).await;
                                 continue;
                             }
                         }
                         if let Some(trade) = position_monitor.remove_trade(&id) {
+                            close_retry_after.remove(&id);
+                            peak_pnl_pct.remove(&id);
                             info!(id = %trade.id, symbol = %trade.symbol, "Position expired (max hold time)");
                             let current_price = latest_price;
                             let pnl = match trade.direction {
@@ -545,6 +602,7 @@ async fn main() -> Result<()> {
                                 entry_ob: trade.entry_ob,
                                 entry_atr_pct: trade.entry_atr_pct,
                                 entry_bb_position: trade.entry_bb_position,
+                                entry_delta_divergence: trade.entry_delta_divergence.clone(),
                             };
                             let _ = journal.log_entry(&record);
                             if let Some(ref tg) = telegram {
@@ -565,6 +623,101 @@ async fn main() -> Result<()> {
                         // Forced close should not leave us in a post-execute cooldown pause.
                         llm_cooldown_until = None;
                     }
+                    // Proactive exits: harvest early edge and protect profits.
+                    let proactive_exits = evaluate_proactive_exits(
+                        position_monitor.active_trades(),
+                        latest_price,
+                        chrono::Utc::now(),
+                        &cfg.execution,
+                        &mut peak_pnl_pct,
+                    );
+                    for (id, reason) in proactive_exits {
+                        let now = chrono::Utc::now();
+                        if close_retry_after
+                            .get(&id)
+                            .is_some_and(|next_try| now < *next_try)
+                        {
+                            continue;
+                        }
+                        if let Some(trade_snapshot) = position_monitor.get_trade(&id) {
+                            if let Err(e) = close_trade_on_exchange(&trade_snapshot, &hl_executor).await {
+                                close_retry_after.insert(
+                                    id,
+                                    now + chrono::Duration::seconds(CLOSE_RETRY_BACKOFF_SECS),
+                                );
+                                let _ = tui_tx_clone.send(TuiUpdate::Log(format!(
+                                    "[{}] Proactive close failed ({}) {} {}: {} — retry in {}s",
+                                    chrono::Utc::now().format("%H:%M:%S"),
+                                    reason,
+                                    trade_snapshot.symbol,
+                                    trade_snapshot.direction,
+                                    e,
+                                    CLOSE_RETRY_BACKOFF_SECS,
+                                ))).await;
+                                continue;
+                            }
+                        }
+                        if let Some(trade) = position_monitor.remove_trade(&id) {
+                            close_retry_after.remove(&id);
+                            peak_pnl_pct.remove(&id);
+                            let current_price = latest_price;
+                            let pnl = match trade.direction {
+                                Direction::Long => (current_price - trade.entry_price) / trade.entry_price * trade.size_usd,
+                                Direction::Short => (trade.entry_price - current_price) / trade.entry_price * trade.size_usd,
+                            };
+                            risk.record_trade_pnl(pnl);
+                            tuner.record_trade();
+                            let pnl_pct = if initial_usd > 0.0 {
+                                (risk.current_equity() - initial_usd) / initial_usd * 100.0
+                            } else {
+                                0.0
+                            };
+                            aggregator.update_daily_pnl(pnl_pct);
+
+                            let record = TradeRecord {
+                                id: trade.id,
+                                ts_open: trade.opened_at,
+                                ts_close: Some(chrono::Utc::now()),
+                                duration_secs: Some(
+                                    (chrono::Utc::now() - trade.opened_at)
+                                        .num_seconds()
+                                        .max(0) as u64,
+                                ),
+                                play_type: trade.play_type,
+                                direction: trade.direction,
+                                signal_level: trade.signal_level,
+                                signal_score: trade.signal_score,
+                                entry_price: trade.entry_price,
+                                exit_price: Some(current_price),
+                                size_usd: trade.size_usd,
+                                leverage: trade.leverage,
+                                pnl_usd: Some(pnl),
+                                exit_reason: Some(reason.clone()),
+                                llm_reasoning: trade.llm_reasoning.clone(),
+                                capital_after: Some(risk.current_equity()),
+                                entry_rsi: trade.entry_rsi,
+                                entry_cvd: trade.entry_cvd,
+                                entry_ob: trade.entry_ob,
+                                entry_atr_pct: trade.entry_atr_pct,
+                                entry_bb_position: trade.entry_bb_position,
+                                entry_delta_divergence: trade.entry_delta_divergence.clone(),
+                            };
+                            let _ = journal.log_entry(&record);
+                            if let Some(ref tg) = telegram {
+                                let r = record.clone();
+                                let tg_ref = tg.clone();
+                                tokio::spawn(async move { tg_ref.send_trade_close(&r).await });
+                            }
+                            let _ = tui_tx_clone.send(TuiUpdate::Log(format!(
+                                "[{}] Proactive exit ({}) {} {} PnL: ${:.2}",
+                                chrono::Utc::now().format("%H:%M:%S"),
+                                reason,
+                                trade.symbol,
+                                trade.direction,
+                                pnl,
+                            ))).await;
+                        }
+                    }
                     risk.set_open_positions(position_monitor.open_count(), &cfg);
 
                     // Check SecondLook due entries
@@ -579,7 +732,7 @@ async fn main() -> Result<()> {
                                 handle_llm_decision(
                                     &decision, &sl_snapshot, &cfg,
                                     &mut risk, &mut position_monitor, &mut second_look,
-                                    &mut tuner, &hl_executor, &journal, &tui_tx_clone,
+                                    &mut tuner, &mut peak_pnl_pct, &hl_executor, &journal, &tui_tx_clone,
                                     &telegram, latest_price,
                                 ).await;
                             }
@@ -642,7 +795,7 @@ async fn main() -> Result<()> {
                                         handle_llm_decision(
                                             &decision, &snapshot, &cfg,
                                             &mut risk, &mut position_monitor, &mut second_look,
-                                            &mut tuner, &hl_executor, &journal, &tui_tx_clone,
+                                            &mut tuner, &mut peak_pnl_pct, &hl_executor, &journal, &tui_tx_clone,
                                             &telegram, latest_price,
                                         ).await;
                                     }
@@ -650,6 +803,63 @@ async fn main() -> Result<()> {
                                         warn!("LLM gate error: {e:#}");
                                         let _ = tui_tx_clone.send(TuiUpdate::Log(format!(
                                             "[{}] LLM error: {e}",
+                                            chrono::Utc::now().format("%H:%M:%S"),
+                                        ))).await;
+                                    }
+                                }
+                            }
+                        }
+                    } else {
+                        // If signal remains unchanged and weak/no-trade for too long, ping LLM once
+                        // so logs/context keep moving while scan continues.
+                        let now = chrono::Utc::now();
+                        let idle_secs = (now - last_signal_change_at).num_seconds();
+                        let ping_due = idle_secs >= cfg.execution.idle_llm_ping_secs as i64;
+                        let ping_gap_ok = last_idle_llm_at
+                            .map(|t| (now - t).num_seconds() >= cfg.execution.idle_llm_ping_secs as i64)
+                            .unwrap_or(true);
+                        let cooldown_active = llm_cooldown_until
+                            .map(|t| now < t)
+                            .unwrap_or(false);
+
+                        if ping_due && ping_gap_ok && !cooldown_active {
+                            if let Err(reason) = risk.can_trade(&cfg) {
+                                if !reason.starts_with("Cooldown") {
+                                    let _ = tui_tx_clone.send(TuiUpdate::Log(format!(
+                                        "[{}] Idle LLM ping blocked by risk: {}",
+                                        now.format("%H:%M:%S"),
+                                        reason,
+                                    ))).await;
+                                }
+                            } else {
+                                let _ = tui_tx_clone.send(TuiUpdate::Log(format!(
+                                    "[{}] Idle market ({idle_secs}s unchanged) → LLM heartbeat",
+                                    now.format("%H:%M:%S"),
+                                ))).await;
+                                let hl_pos = hl_positions_for_engine.read().await;
+                                let pos_ctx = build_position_context(&hl_pos, &risk, &cfg);
+                                last_idle_llm_at = Some(now);
+                                match llm_gate.evaluate(&snapshot, &cfg, &pos_ctx).await {
+                                    Ok(decision) => {
+                                        let cd_secs = match &decision {
+                                            LlmDecision::Skip { .. } => LLM_SKIP_COOLDOWN_SECS,
+                                            LlmDecision::Execute { .. } => LLM_EXECUTE_COOLDOWN_SECS,
+                                            LlmDecision::SecondLook { .. } => 0,
+                                        };
+                                        if cd_secs > 0 {
+                                            llm_cooldown_until = Some(chrono::Utc::now() + chrono::Duration::seconds(cd_secs));
+                                        }
+                                        handle_llm_decision(
+                                            &decision, &snapshot, &cfg,
+                                            &mut risk, &mut position_monitor, &mut second_look,
+                                            &mut tuner, &mut peak_pnl_pct, &hl_executor, &journal, &tui_tx_clone,
+                                            &telegram, latest_price,
+                                        ).await;
+                                    }
+                                    Err(e) => {
+                                        warn!("Idle LLM heartbeat error: {e:#}");
+                                        let _ = tui_tx_clone.send(TuiUpdate::Log(format!(
+                                            "[{}] Idle LLM error: {e}",
                                             chrono::Utc::now().format("%H:%M:%S"),
                                         ))).await;
                                     }
@@ -834,9 +1044,13 @@ async fn main() -> Result<()> {
     });
 
     // TUI on main thread
+    let fee_round_trip_pct =
+        (config.execution.fee_bps_per_side.max(0.0) * 2.0) / 100.0
+        + config.execution.sell_trigger_extra_buffer_pct.max(0.0);
     let mut app = App::new(
         initial_tui_equity,
         config.capital.initial_usd,
+        fee_round_trip_pct,
     );
 
     crossterm::terminal::enable_raw_mode()?;
@@ -903,6 +1117,7 @@ async fn handle_llm_decision(
     position_monitor: &mut PositionMonitor,
     second_look: &mut SecondLookScheduler,
     tuner: &mut SignalTuner,
+    peak_pnl_pct: &mut HashMap<Uuid, f64>,
     hl_executor: &Option<HlExecutor>,
     journal: &TradeLogger,
     tui_tx: &mpsc::Sender<TuiUpdate>,
@@ -954,6 +1169,7 @@ async fn handle_llm_decision(
                         let Some(opp_trade) = position_monitor.remove_trade(opp_id) else {
                             continue;
                         };
+                        peak_pnl_pct.remove(opp_id);
                         let current_price = latest_price;
                         // size_usd is notional (margin × leverage), so no extra lev multiplier
                         let pnl = match opp_trade.direction {
@@ -988,6 +1204,7 @@ async fn handle_llm_decision(
                             entry_ob: opp_trade.entry_ob,
                             entry_atr_pct: opp_trade.entry_atr_pct,
                             entry_bb_position: opp_trade.entry_bb_position,
+                            entry_delta_divergence: opp_trade.entry_delta_divergence.clone(),
                         };
                         let _ = journal.log_entry(&record);
                         if let Some(ref tg) = telegram {
@@ -1031,6 +1248,10 @@ async fn handle_llm_decision(
                 "Executing trade"
             );
 
+            let round_trip_fee_pct = (config.execution.fee_bps_per_side.max(0.0) * 2.0) / 100.0;
+            let tp_fee_floor_pct = round_trip_fee_pct + config.execution.sell_trigger_extra_buffer_pct.max(0.0);
+            let effective_take_profit_pct = take_profit_pct.max(tp_fee_floor_pct);
+
             // Place order via HL executor
             let mut entry_price = 0.0;
             if let Some(ref hl) = hl_executor {
@@ -1053,9 +1274,9 @@ async fn handle_llm_decision(
                                 entry_price * (1.0 + stop_loss_pct / 100.0)
                             };
                             let tp_price = if is_buy {
-                                entry_price * (1.0 + take_profit_pct / 100.0)
+                                entry_price * (1.0 + effective_take_profit_pct / 100.0)
                             } else {
-                                entry_price * (1.0 - take_profit_pct / 100.0)
+                                entry_price * (1.0 - effective_take_profit_pct / 100.0)
                             };
                             let _ = hl.stop_loss("BTC", sl_price, sz_coin, !is_buy).await;
                             let _ = hl.take_profit("BTC", tp_price, sz_coin, !is_buy).await;
@@ -1088,7 +1309,7 @@ async fn handle_llm_decision(
                 size_usd: notional_usd,
                 leverage: Some(leverage),
                 stop_loss_pct: *stop_loss_pct,
-                take_profit_pct: *take_profit_pct,
+                take_profit_pct: effective_take_profit_pct,
                 opened_at: chrono::Utc::now(),
                 max_hold_secs: config.execution.max_trade_duration_secs,
                 llm_reasoning: reasoning.clone(),
@@ -1099,10 +1320,12 @@ async fn handle_llm_decision(
                 entry_ob: ind.ob_imbalance,
                 entry_atr_pct: ind.atr_pct,
                 entry_bb_position: ind.bb_position,
+                entry_delta_divergence: ind.delta_divergence.clone(),
             };
             let trade_id = trade.id;
             let trade_opened_at = trade.opened_at;
             position_monitor.add_trade(trade);
+            peak_pnl_pct.insert(trade_id, 0.0);
             risk.set_open_positions(position_monitor.open_count(), config);
             risk.record_trade_open();
 
@@ -1129,6 +1352,7 @@ async fn handle_llm_decision(
                 entry_ob: ind.ob_imbalance,
                 entry_atr_pct: ind.atr_pct,
                 entry_bb_position: ind.bb_position,
+                entry_delta_divergence: ind.delta_divergence.clone(),
             };
             let _ = journal.log_entry(&open_record);
 
@@ -1144,9 +1368,10 @@ async fn handle_llm_decision(
             }
 
             let _ = tui_tx.send(TuiUpdate::Log(format!(
-                "[{}] EXECUTE {} {} ${:.0} @{:.0} lev={} — {}",
+                "[{}] EXECUTE {} {} ${:.0} @{:.0} lev={} tp={:.3}% (req {:.3}%) — {}",
                 chrono::Utc::now().format("%H:%M:%S"),
                 play_type, direction, notional_usd, entry_price, leverage,
+                effective_take_profit_pct, take_profit_pct,
                 reasoning,
             ))).await;
         }
@@ -1268,20 +1493,7 @@ async fn close_trade_on_exchange(
     hl_executor: &Option<HlExecutor>,
 ) -> Result<(), String> {
     if let Some(hl) = hl_executor {
-        let is_buy = trade.direction == Direction::Short;
-        let sz = trade.size_usd / trade.entry_price;
-        if sz <= 0.0 {
-            return Err(format!("invalid close size {:.8}", sz));
-        }
-        match hl
-            .market_order(
-                trade.symbol.hl_coin(),
-                is_buy,
-                sz,
-                trade.leverage.unwrap_or(1),
-            )
-            .await
-        {
+        match hl.market_close(trade.symbol.hl_coin()).await {
             Ok(r) if r.success => Ok(()),
             Ok(r) => Err(format!("order rejected: {}", r.message)),
             Err(e) => Err(format!("{e:#}")),

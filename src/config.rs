@@ -67,6 +67,30 @@ pub struct ExecutionConfig {
     pub max_trade_duration_secs: u64,
     pub max_second_looks: u32,
     pub signal_eval_interval_secs: u64,
+    #[serde(default = "default_true")]
+    pub enable_proactive_exit: bool,
+    #[serde(default = "default_fast_take_window_secs")]
+    pub fast_take_window_secs: u64,
+    #[serde(default = "default_fast_take_trigger_pct")]
+    pub fast_take_trigger_pct: f64,
+    #[serde(default = "default_profit_lock_trigger_pct")]
+    pub profit_lock_trigger_pct: f64,
+    #[serde(default = "default_profit_lock_floor_pct")]
+    pub profit_lock_floor_pct: f64,
+    #[serde(default = "default_peak_giveback_ratio")]
+    pub peak_giveback_ratio: f64,
+    #[serde(default = "default_stale_after_secs")]
+    pub stale_after_secs: u64,
+    #[serde(default = "default_stale_min_pnl_pct")]
+    pub stale_min_pnl_pct: f64,
+    #[serde(default = "default_idle_llm_ping_secs")]
+    pub idle_llm_ping_secs: u64,
+    /// Estimated taker fee in bps per side (entry or exit).
+    #[serde(default = "default_fee_bps_per_side")]
+    pub fee_bps_per_side: f64,
+    /// Extra sell-trigger buffer (%) above fees to avoid micro-profit churn.
+    #[serde(default = "default_sell_trigger_extra_buffer_pct")]
+    pub sell_trigger_extra_buffer_pct: f64,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -128,6 +152,18 @@ pub struct SignalConfig {
     /// VWAP scoring weight when deviation is meaningful.
     #[serde(default = "default_1")]
     pub vwap_weight: i32,
+    /// Lookback window (1m bars) for CVD/price delta divergence detection.
+    #[serde(default = "default_delta_div_lookback_bars")]
+    pub delta_div_lookback_bars: usize,
+    /// Score weight when bullish/bearish delta divergence is detected.
+    #[serde(default = "default_delta_div_weight")]
+    pub delta_div_weight: i32,
+    /// Score weight for OI+price directional confirmation.
+    #[serde(default = "default_oi_weight")]
+    pub oi_weight: i32,
+    /// Minimum OI percent change to treat as meaningful.
+    #[serde(default = "default_oi_delta_min_pct")]
+    pub oi_delta_min_pct: f64,
 }
 
 fn default_2() -> i32 { 2 }
@@ -140,6 +176,21 @@ fn default_ob_lean_threshold() -> f64 { 1.3 }
 fn default_ob_strong_threshold() -> f64 { 2.0 }
 fn default_regime_trend_spread_pct() -> f64 { 0.05 }
 fn default_vwap_dev_reversion_pct() -> f64 { 0.3 }
+fn default_delta_div_lookback_bars() -> usize { 12 }
+fn default_delta_div_weight() -> i32 { 2 }
+fn default_oi_weight() -> i32 { 1 }
+fn default_oi_delta_min_pct() -> f64 { 0.03 }
+fn default_true() -> bool { true }
+fn default_fast_take_window_secs() -> u64 { 20 }
+fn default_fast_take_trigger_pct() -> f64 { 0.08 }
+fn default_profit_lock_trigger_pct() -> f64 { 0.10 }
+fn default_profit_lock_floor_pct() -> f64 { 0.01 }
+fn default_peak_giveback_ratio() -> f64 { 0.40 }
+fn default_stale_after_secs() -> u64 { 30 }
+fn default_stale_min_pnl_pct() -> f64 { 0.02 }
+fn default_idle_llm_ping_secs() -> u64 { 60 }
+fn default_fee_bps_per_side() -> f64 { 3.5 }
+fn default_sell_trigger_extra_buffer_pct() -> f64 { 0.02 }
 
 #[derive(Debug, Clone, Deserialize)]
 pub struct TuningConfig {

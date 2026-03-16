@@ -3,7 +3,7 @@ use tracing::{debug, info};
 
 use crate::config::Config;
 use crate::signals::candle_builder::CandleBuilder;
-use crate::signals::indicators::Indicators;
+use crate::signals::indicators::{DeltaDivergence, Indicators};
 use crate::types::*;
 
 /// Signal aggregator: computes weighted bull/bear scores from indicators,
@@ -13,7 +13,10 @@ pub struct SignalAggregator {
     candle_builder: CandleBuilder,
     // Latest state
     latest_price: f64,
+    prev_price: f64,
     latest_funding: f64,
+    latest_oi: Option<f64>,
+    prev_oi: Option<f64>,
     latest_ob_imbalance: f64,
     daily_pnl_pct: f64,
     kill_switch_triggered: bool,
@@ -26,7 +29,10 @@ impl SignalAggregator {
             indicators: Indicators::new(),
             candle_builder: CandleBuilder::new(),
             latest_price: 0.0,
+            prev_price: 0.0,
             latest_funding: 0.0,
+            latest_oi: None,
+            prev_oi: None,
             latest_ob_imbalance: 1.0,
             daily_pnl_pct: 0.0,
             kill_switch_triggered: false,
@@ -35,6 +41,9 @@ impl SignalAggregator {
     }
 
     pub fn update_price(&mut self, price: f64) {
+        if self.latest_price > 0.0 {
+            self.prev_price = self.latest_price;
+        }
         self.latest_price = price;
     }
 
@@ -45,6 +54,13 @@ impl SignalAggregator {
 
     pub fn update_funding(&mut self, rate: f64) {
         self.latest_funding = rate;
+    }
+
+    pub fn update_open_interest(&mut self, oi: f64) {
+        if let Some(cur) = self.latest_oi {
+            self.prev_oi = Some(cur);
+        }
+        self.latest_oi = Some(oi);
     }
 
     pub fn update_ob_imbalance(&mut self, imbalance: f64) {
@@ -130,6 +146,21 @@ impl SignalAggregator {
             }
         }
 
+        // --- Delta divergence (price new high/low not confirmed by CVD) ---
+        let delta_div = self
+            .indicators
+            .delta_divergence(sig.delta_div_lookback_bars);
+        indicators.delta_divergence = delta_div.map(|d| match d {
+            DeltaDivergence::Bullish => "bullish".to_string(),
+            DeltaDivergence::Bearish => "bearish".to_string(),
+        });
+        if let Some(div) = delta_div {
+            match div {
+                DeltaDivergence::Bullish => bull += sig.delta_div_weight,
+                DeltaDivergence::Bearish => bear += sig.delta_div_weight,
+            }
+        }
+
         // --- Funding score layer (in addition to hard filter) ---
         if funding.abs() >= sig.funding_score_threshold {
             // Negative funding favors longs, positive funding favors shorts.
@@ -137,6 +168,34 @@ impl SignalAggregator {
                 bull += sig.funding_weight;
             } else if funding > 0.0 {
                 bear += sig.funding_weight;
+            }
+        }
+
+        // --- OI delta + price direction confirmation ---
+        indicators.open_interest = self.latest_oi;
+        if let (Some(cur_oi), Some(prev_oi)) = (self.latest_oi, self.prev_oi) {
+            if prev_oi > 0.0 && self.prev_price > 0.0 && self.latest_price > 0.0 {
+                let oi_delta_pct = ((cur_oi - prev_oi) / prev_oi) * 100.0;
+                indicators.oi_delta_pct = Some(oi_delta_pct);
+                let price_up = self.latest_price > self.prev_price;
+                let price_down = self.latest_price < self.prev_price;
+                let oi_up = oi_delta_pct >= sig.oi_delta_min_pct;
+                let oi_down = oi_delta_pct <= -sig.oi_delta_min_pct;
+
+                if price_up && oi_up {
+                    indicators.oi_bias = Some("bullish_confirm".to_string());
+                    bull += sig.oi_weight;
+                } else if price_down && oi_up {
+                    indicators.oi_bias = Some("bearish_confirm".to_string());
+                    bear += sig.oi_weight;
+                } else if price_down && oi_down {
+                    indicators.oi_bias = Some("possible_bottom".to_string());
+                    bull += 1;
+                } else if price_up && oi_down {
+                    indicators.oi_bias = Some("caution_short_cover".to_string());
+                } else {
+                    indicators.oi_bias = Some("neutral".to_string());
+                }
             }
         }
 

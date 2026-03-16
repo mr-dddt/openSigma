@@ -159,6 +159,18 @@ impl HyperliquidFeed {
                     .await;
             }
         }
+        if let Some(ref oi) = ctx.ctx.open_interest {
+            if let Ok(value) = oi.parse::<f64>() {
+                let _ = self
+                    .event_tx
+                    .send(MarketEvent::OpenInterest(OpenInterestTick {
+                        symbol: Symbol::BTC,
+                        value,
+                        timestamp: Utc::now(),
+                    }))
+                    .await;
+            }
+        }
     }
 
     async fn handle_l2_book(&self, book: &L2BookData) {
@@ -316,6 +328,8 @@ struct ActiveAssetCtxData {
 #[derive(Debug, Deserialize)]
 struct AssetCtx {
     funding: Option<String>,
+    #[serde(rename = "openInterest", alias = "oi", alias = "open_interest")]
+    open_interest: Option<String>,
 }
 
 // ---------------------------------------------------------------------------
