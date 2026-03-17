@@ -234,7 +234,7 @@ impl App {
                 ),
             ]),
             Line::from(vec![
-                Span::styled("  Today:", Style::default().fg(Color::Cyan)),
+                Span::styled(" Today:", Style::default().fg(Color::Cyan)),
                 Span::styled(
                     format!(" {:+.2}%", self.daily_pnl_pct),
                     Style::default().fg(daily_pnl_color),
